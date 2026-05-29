@@ -5,6 +5,9 @@ from torch.utils.data import Dataset, DataLoader
 import time
 from tokenflow import TokenFlowTokenizer
 
+# Toggle dataset mode: "simulated" or "cifar10"
+DATASET_MODE = "cifar10"
+
 class SimulatedImageDataset(Dataset):
     """
     Simulates a high-throughput image dataset (e.g. ImageNet/WebVid visual frames)
@@ -24,6 +27,7 @@ def train_tokenflow_one_epoch():
     print("==================================================")
     print("      TokenFlow Dual-Codebook Training Loop       ")
     print("==================================================")
+    print(f"Dataset Mode selected: {DATASET_MODE.upper()}")
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Training execution device: {device}")
@@ -36,8 +40,26 @@ def train_tokenflow_one_epoch():
         pixel_dim=256
     ).to(device)
     
-    # 2. Setup simulated dataloader
-    dataset = SimulatedImageDataset(num_samples=32)
+    # 2. Setup dataloader (Simulated or Real CIFAR-10)
+    if DATASET_MODE == "cifar10":
+        try:
+            import torchvision.transforms as transforms
+            import torchvision.datasets as datasets
+            
+            transform = transforms.Compose([
+                transforms.Resize((256, 256)), # Upscale to match TokenFlow expected resolution
+                transforms.ToTensor(),
+                transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+            ])
+            # Download and load training data
+            dataset = datasets.CIFAR10(root="./data", train=True, download=True, transform=transform)
+            print("Successfully loaded CIFAR-10 dataset.")
+        except Exception as e:
+            print(f"[Warning] Failed to load CIFAR-10: {e}. Falling back to Simulated mode.")
+            dataset = SimulatedImageDataset(num_samples=32)
+    else:
+        dataset = SimulatedImageDataset(num_samples=32)
+        
     dataloader = DataLoader(dataset, batch_size=4, shuffle=True)
     
     # 3. Setup optimizer
