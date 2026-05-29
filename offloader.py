@@ -115,6 +115,38 @@ def test_offloading():
     else:
         print("Note: Simulated offloading successfully on CPU.")
 
+class OffloadedLayerWrapper(nn.Module):
+    """
+    A PyTorch Layer Wrapper that dynamically swaps layer weights and all input tensors
+    to the target GPU execution device during the forward pass, then immediately
+    swaps the weights back to CPU RAM. Compatible with all PyTorch and Hugging Face architectures.
+    """
+    def __init__(self, original_layer, execution_device="cuda"):
+        super().__init__()
+        self.layer = original_layer.to("cpu")
+        self.execution_device = torch.device(execution_device)
+
+    def forward(self, *args, **kwargs):
+        # 1. Swap current layer parameters to GPU VRAM
+        self.layer.to(self.execution_device)
+        
+        # 2. Transfer all input tensors in args/kwargs to GPU execution device
+        new_args = tuple(x.to(self.execution_device) if isinstance(x, torch.Tensor) else x for x in args)
+        new_kwargs = {k: v.to(self.execution_device) if isinstance(v, torch.Tensor) else v for k, v in kwargs.items()}
+        
+        # 3. Execute the actual forward step on GPU
+        output = self.layer(*new_args, **new_kwargs)
+        
+        # 4. Offload layer back to CPU (using non_blocking to overlap transfers)
+        self.layer.to("cpu", non_blocking=True)
+        
+        # 5. Ensure that all output tensors remain on GPU for the next layer's inputs
+        if isinstance(output, tuple):
+            return tuple(x.to(self.execution_device) if isinstance(x, torch.Tensor) else x for x in output)
+        elif isinstance(output, torch.Tensor):
+            return output.to(self.execution_device)
+        return output
+
 if __name__ == "__main__":
     import time
     test_offloading()

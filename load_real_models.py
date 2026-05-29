@@ -38,15 +38,23 @@ def load_and_wrap_real_model():
         print("❌ Could not dynamically extract transformer layers. Model structure unknown.")
         return
 
-    # 3. Instantiate the VRAM Offloader wrapper
-    print("\nWrapping layers with LayerWiseGPUOffloader...")
-    offloaded_backbone = LayerWiseGPUOffloader(layers_list, execution_device=device)
+    # 3. Wrap each layer in our custom OffloadedLayerWrapper
+    print("\nWrapping layers with OffloadedLayerWrapper...")
+    from offloader import OffloadedLayerWrapper
+    wrapped_layers = [OffloadedLayerWrapper(layer, execution_device=device) for layer in layers_list]
+    wrapped_layers_module = nn.ModuleList(wrapped_layers)
     
-    # Replace model's sequential layers with our offloaded layers
+    # Replace model's sequential layers with our offloaded wrapped layers
     if hasattr(raw_model, "layers"):
-        raw_model.layers = offloaded_backbone.layers
+        raw_model.layers = wrapped_layers_module
     elif hasattr(raw_model, "h"):
-        raw_model.h = offloaded_backbone.layers
+        raw_model.h = wrapped_layers_module
+        
+    # Move lightweight normalization and rotary embedding modules to the GPU permanently
+    if hasattr(raw_model, "norm") and raw_model.norm is not None:
+        raw_model.norm.to(device)
+    if hasattr(raw_model, "rotary_emb") and raw_model.rotary_emb is not None:
+        raw_model.rotary_emb.to(device)
 
     # 4. Run inference step
     text_prompt = "Ternary quantization enables multimodal video generation under a 3GB VRAM limit."
@@ -55,26 +63,17 @@ def load_and_wrap_real_model():
     inputs = tokenizer(text_prompt, return_tensors="pt")
     input_ids = inputs["input_ids"] # (B, S)
     
-    # Note: When using LayerWiseGPUOffloader on Hugging Face models,
-    # the forward pass of the base model automatically invokes our layer-wise forward logic.
-    print("\nExecuting forward pass through real wrapped layers...")
+    # Note: When using OffloadedLayerWrapper, the native Hugging Face model call
+    # automatically computes causal masks and RoPE embeddings on CPU/GPU seamlessly.
+    print("\nExecuting forward pass through native Hugging Face model (with offloaded layers)...")
     with torch.no_grad():
-        # Keep inputs on CPU for embedding lookup since raw_model is on CPU RAM
+        # Keep input_ids on CPU for embedding lookup
         t0 = time.time()
         
-        # 1. Retrieve embeddings on CPU
-        hidden_states_cpu = raw_model.embed_tokens(input_ids.to("cpu")) # (B, S, D)
-        # 2. Transfer the embedded latent tensor to the target execution device (GPU)
-        hidden_states = hidden_states_cpu.to(device)
+        # Run standard Hugging Face forward pass!
+        out_hf = raw_model(input_ids=input_ids.to("cpu"))
+        out = out_hf.last_hidden_state
         
-        # Pass sequentially through offloaded layers
-        fused_hidden_states = offloaded_backbone(hidden_states)
-        
-        # 3. Swap the final normalization layer to the GPU device
-        raw_model.norm.to(device)
-        out = raw_model.norm(fused_hidden_states)
-        # 4. Offload the normalization layer back to CPU RAM to conserve VRAM
-        raw_model.norm.to("cpu")
         t1 = time.time()
         
     print("\n--- Execution Stats ---")
