@@ -7,7 +7,36 @@ from tokenflow import TokenFlowDualQuantizer, TokenFlowTokenizer
 from mcp import MobileConditioningProjector
 from ssm_temporal import TemporalWedgeBlock
 from dynamap import MiniCPMSALAMock, BonsaiDiffusionMock
-from offloader import OffloadedLayerWrapper
+class OffloadedLayerWrapper(nn.Module):
+    """
+    A PyTorch Layer Wrapper that dynamically swaps layer weights and all input tensors
+    to the target GPU execution device during the forward pass, then immediately
+    swaps the weights back to CPU RAM only during inference (evaluation).
+    During training, parameters remain on GPU to allow autograd backpropagation.
+    """
+    def __init__(self, original_layer, execution_device="cuda"):
+        super().__init__()
+        self.layer = original_layer.to("cpu")
+        self.execution_device = torch.device(execution_device)
+
+    def forward(self, *args, **kwargs):
+        # 1. Swap current layer parameters to VRAM
+        self.layer.to(self.execution_device)
+        
+        # 2. Transfer all input tensors (including nested tuples/lists) to execution device
+        from offloader import recursive_to_device
+        new_args = tuple(recursive_to_device(x, self.execution_device) for x in args)
+        new_kwargs = {k: recursive_to_device(v, self.execution_device) for k, v in kwargs.items()}
+        
+        # 3. Execute the actual forward step on GPU
+        output = self.layer(*new_args, **new_kwargs)
+        
+        # 4. Offload layer back to CPU ONLY in evaluation mode
+        if not self.training:
+            self.layer.to("cpu", non_blocking=True)
+            
+        # 5. Ensure that all output tensors remain on execution device
+        return recursive_to_device(output, self.execution_device)
 
 class AudioTokenFlowTokenizer(nn.Module):
     """
