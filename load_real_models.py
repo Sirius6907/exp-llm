@@ -59,19 +59,22 @@ def load_and_wrap_real_model():
     # the forward pass of the base model automatically invokes our layer-wise forward logic.
     print("\nExecuting forward pass through real wrapped layers...")
     with torch.no_grad():
-        # Move inputs to target device
-        input_ids = input_ids.to(device)
+        # Keep inputs on CPU for embedding lookup since raw_model is on CPU RAM
         t0 = time.time()
         
-        # We manually forward through the offloader wrapper for demonstration
-        # Hidden states start as embedded inputs
-        hidden_states = raw_model.embed_tokens(input_ids) # (B, S, D)
+        # 1. Retrieve embeddings on CPU
+        hidden_states_cpu = raw_model.embed_tokens(input_ids.to("cpu")) # (B, S, D)
+        # 2. Transfer the embedded latent tensor to the target execution device (GPU)
+        hidden_states = hidden_states_cpu.to(device)
         
         # Pass sequentially through offloaded layers
         fused_hidden_states = offloaded_backbone(hidden_states)
         
-        # Final norm
+        # 3. Swap the final normalization layer to the GPU device
+        raw_model.norm.to(device)
         out = raw_model.norm(fused_hidden_states)
+        # 4. Offload the normalization layer back to CPU RAM to conserve VRAM
+        raw_model.norm.to("cpu")
         t1 = time.time()
         
     print("\n--- Execution Stats ---")
