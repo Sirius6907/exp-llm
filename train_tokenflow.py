@@ -6,7 +6,7 @@ import time
 from tokenflow import TokenFlowTokenizer
 
 # Toggle dataset mode: "simulated" or "cifar10"
-DATASET_MODE = "cifar10"
+DATASET_MODE = "simulated"
 
 class SimulatedImageDataset(Dataset):
     """
