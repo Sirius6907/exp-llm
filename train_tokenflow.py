@@ -83,7 +83,13 @@ def train_tokenflow_one_epoch():
         epoch_semantic = 0.0
         epoch_commit = 0.0
         
-        for batch_idx, batch_x in enumerate(dataloader):
+        for batch_idx, batch_data in enumerate(dataloader):
+            # Extract only the images tensor (CIFAR-10 returns [images, labels])
+            if isinstance(batch_data, (list, tuple)):
+                batch_x = batch_data[0]
+            else:
+                batch_x = batch_data
+                
             batch_x = batch_x.to(device)
             optimizer.zero_grad()
             
