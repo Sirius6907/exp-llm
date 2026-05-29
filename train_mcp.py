@@ -104,6 +104,12 @@ def train_mcp_one_epoch():
         avg_loss = epoch_loss / len(dataloader)
         print(f"Average Epoch Alignment Loss: {avg_loss:.4f}")
         
+    # 5. Save the trained checkpoint to disk
+    checkpoint_path = "mcp_alignment.pth"
+    print(f"\nSaving model checkpoint to: {checkpoint_path}...")
+    torch.save(mcp_projector.state_dict(), checkpoint_path)
+    print("Checkpoint saved successfully.")
+    
     t1 = time.time()
     print(f"Completed in {t1 - t0:.2f} seconds.")
     print("==================================================")

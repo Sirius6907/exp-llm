@@ -142,6 +142,12 @@ def train_tokenflow_one_epoch():
         avg_loss = epoch_loss / len(dataloader)
         print(f"Average Epoch Loss: {avg_loss:.4f}")
         
+    # 5. Save the trained checkpoint to disk
+    checkpoint_path = "tokenflow_cifar10.pth"
+    print(f"\nSaving model checkpoint to: {checkpoint_path}...")
+    torch.save(model.state_dict(), checkpoint_path)
+    print("Checkpoint saved successfully.")
+    
     t1 = time.time()
     print(f"Completed in {t1 - t0:.2f} seconds.")
     print("==================================================")
