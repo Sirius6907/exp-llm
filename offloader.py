@@ -115,6 +115,21 @@ def test_offloading():
     else:
         print("Note: Simulated offloading successfully on CPU.")
 
+def recursive_to_device(obj, device):
+    """
+    Recursively traverses nested structures (tuples, lists, dicts) and moves any
+    PyTorch tensors to the target execution device.
+    """
+    if isinstance(obj, torch.Tensor):
+        return obj.to(device)
+    elif isinstance(obj, tuple):
+        return tuple(recursive_to_device(x, device) for x in obj)
+    elif isinstance(obj, list):
+        return [recursive_to_device(x, device) for x in obj]
+    elif isinstance(obj, dict):
+        return {k: recursive_to_device(v, device) for k, v in obj.items()}
+    return obj
+
 class OffloadedLayerWrapper(nn.Module):
     """
     A PyTorch Layer Wrapper that dynamically swaps layer weights and all input tensors
@@ -130,9 +145,9 @@ class OffloadedLayerWrapper(nn.Module):
         # 1. Swap current layer parameters to GPU VRAM
         self.layer.to(self.execution_device)
         
-        # 2. Transfer all input tensors in args/kwargs to GPU execution device
-        new_args = tuple(x.to(self.execution_device) if isinstance(x, torch.Tensor) else x for x in args)
-        new_kwargs = {k: v.to(self.execution_device) if isinstance(v, torch.Tensor) else v for k, v in kwargs.items()}
+        # 2. Transfer all input tensors (including nested tuples/lists) to GPU execution device
+        new_args = tuple(recursive_to_device(x, self.execution_device) for x in args)
+        new_kwargs = {k: recursive_to_device(v, self.execution_device) for k, v in kwargs.items()}
         
         # 3. Execute the actual forward step on GPU
         output = self.layer(*new_args, **new_kwargs)
@@ -141,11 +156,7 @@ class OffloadedLayerWrapper(nn.Module):
         self.layer.to("cpu", non_blocking=True)
         
         # 5. Ensure that all output tensors remain on GPU for the next layer's inputs
-        if isinstance(output, tuple):
-            return tuple(x.to(self.execution_device) if isinstance(x, torch.Tensor) else x for x in output)
-        elif isinstance(output, torch.Tensor):
-            return output.to(self.execution_device)
-        return output
+        return recursive_to_device(output, self.execution_device)
 
 if __name__ == "__main__":
     import time
