@@ -194,29 +194,40 @@ class AnyToAnyOrchestrator(nn.Module):
     def route(self, mode="text_to_text", text_input=None, image_input=None, video_input=None, audio_input=None, num_frames=4, audio_len=16000):
         """
         Dynamically analyzes input formats and executes the cheapest performance path.
-        Supports all 16 cross-modal paths.
+        Supports all 16 cross-modal paths with dynamic batch sizes.
         """
         t_start = time.time()
         print(f"[AnyToAnyOrchestrator] Routing pathway: '{mode.upper()}' on device: {self.device}")
         
+        # Determine Batch Size dynamically
+        B = 1
+        if text_input is not None:
+            B = text_input.shape[0]
+        elif image_input is not None:
+            B = image_input.shape[0]
+        elif video_input is not None:
+            B = video_input.shape[0]
+        elif audio_input is not None:
+            B = audio_input.shape[0]
+            
         # Determine Source Modality
         src = mode.split("_to_")[0]
         tgt = mode.split("_to_")[1]
         
         # --- SOURCE PROCESSING ---
         if src == "text":
-            text_tokens = text_input if isinstance(text_input, torch.Tensor) else torch.randint(0, self.vocab_size, (1, 512), device=self.device)
+            text_tokens = text_input if isinstance(text_input, torch.Tensor) else torch.randint(0, self.vocab_size, (B, 512), device=self.device)
             vlm_hidden_states = self.vlm(text_tokens=text_tokens)
             conditioning_c = self.mcp(vlm_hidden_states)
             
         elif src == "image":
-            img = image_input if isinstance(image_input, torch.Tensor) else torch.randn(1, 3, 64, 64, device=self.device)
+            img = image_input if isinstance(image_input, torch.Tensor) else torch.randn(B, 3, 64, 64, device=self.device)
             q_s, q_p, indices = self.image_tokenizer.encode(img)
             vlm_hidden_states = self.vlm(visual_latents=q_s)
             conditioning_c = self.mcp(vlm_hidden_states)
             
         elif src == "video":
-            vid = video_input if isinstance(video_input, torch.Tensor) else torch.randn(1, num_frames, 3, 64, 64, device=self.device)
+            vid = video_input if isinstance(video_input, torch.Tensor) else torch.randn(B, num_frames, 3, 64, 64, device=self.device)
             q_s_list = []
             q_p_list = []
             for t in range(vid.shape[1]):
@@ -228,7 +239,7 @@ class AnyToAnyOrchestrator(nn.Module):
             conditioning_c = self.mcp(vlm_hidden_states)
             
         elif src == "audio":
-            aud = audio_input if isinstance(audio_input, torch.Tensor) else torch.randn(1, 1, audio_len, device=self.device)
+            aud = audio_input if isinstance(audio_input, torch.Tensor) else torch.randn(B, 1, audio_len, device=self.device)
             q_s, q_p, indices = self.audio_tokenizer.encode(aud)
             # Reshape 1D audio semantic feature to 4D to be fully compatible with VLM mock visual_latents parameter
             q_s_vlm = q_s.unsqueeze(-1)
@@ -243,9 +254,9 @@ class AnyToAnyOrchestrator(nn.Module):
             output = self.text_head(vlm_hidden_states)
             
         elif tgt == "image":
-            noise = torch.randn(1, 256, self.latent_dim, device=self.device)
+            noise = torch.randn(B, 256, self.latent_dim, device=self.device)
             diffused_latent = self.diffusion_image(noise, conditioning_c)
-            diffused_latent_spatial = diffused_latent.permute(0, 2, 1).reshape(1, self.latent_dim, 16, 16)
+            diffused_latent_spatial = diffused_latent.permute(0, 2, 1).reshape(B, self.latent_dim, 16, 16)
             output = self.image_tokenizer.decode_pixel(diffused_latent_spatial)
             
         elif tgt == "video":
@@ -255,22 +266,22 @@ class AnyToAnyOrchestrator(nn.Module):
                 if mode == "image_to_video" and t == 0:
                     # In image-to-video, first frame utilizes encoded pixel latent
                     # Reshape q_p from (B, C, H, W) to (B, L, C)
-                    current_latent = q_p.permute(0, 2, 3, 1).reshape(1, 256, self.latent_dim)
+                    current_latent = q_p.permute(0, 2, 3, 1).reshape(B, -1, self.latent_dim)
                 else:
-                    noise = torch.randn(1, 256, self.latent_dim, device=self.device)
+                    noise = torch.randn(B, 256, self.latent_dim, device=self.device)
                     current_latent = self.diffusion_image(noise, conditioning_c)
                     
                 coherent_latent, state = self.temporal_wedge(current_latent, state)
-                coherent_latent_spatial = coherent_latent.permute(0, 2, 1).reshape(1, self.latent_dim, 16, 16)
+                coherent_latent_spatial = coherent_latent.permute(0, 2, 1).reshape(B, self.latent_dim, 16, 16)
                 frame = self.image_tokenizer.decode_pixel(coherent_latent_spatial)
                 frames.append(frame)
             output = torch.stack(frames, dim=1)
             
         elif tgt == "audio":
             L_audio_latent = audio_len // 8
-            noise = torch.randn(1, L_audio_latent, self.latent_dim, device=self.device)
+            noise = torch.randn(B, L_audio_latent, self.latent_dim, device=self.device)
             diffused_latent = self.diffusion_audio(noise, conditioning_c)
-            diffused_latent_spatial = diffused_latent.permute(0, 2, 1) # (1, latent_dim, L_audio_latent)
+            diffused_latent_spatial = diffused_latent.permute(0, 2, 1) # (B, latent_dim, L_audio_latent)
             output = self.audio_tokenizer.decode_pixel(diffused_latent_spatial)
             
         else:
