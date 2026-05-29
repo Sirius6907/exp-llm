@@ -7,12 +7,35 @@ from tokenflow import TokenFlowDualQuantizer, TokenFlowTokenizer
 from mcp import MobileConditioningProjector
 from ssm_temporal import TemporalWedgeBlock
 from dynamap import MiniCPMSALAMock, BonsaiDiffusionMock
+class OffloadInputHook(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, layer):
+        ctx.layer = layer
+        return x.clone() if isinstance(x, torch.Tensor) else x
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        ctx.layer.to("cpu", non_blocking=True)
+        return grad_output, None
+
+class OffloadOutputHook(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, layer, device):
+        ctx.layer = layer
+        ctx.device = device
+        return x.clone() if isinstance(x, torch.Tensor) else x
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        ctx.layer.to(ctx.device)
+        return grad_output, None, None
+
 class OffloadedLayerWrapper(nn.Module):
     """
     A PyTorch Layer Wrapper that dynamically swaps layer weights and all input tensors
     to the target GPU execution device during the forward pass, then immediately
-    swaps the weights back to CPU RAM only during inference (evaluation).
-    During training, parameters remain on GPU to allow autograd backpropagation.
+    swaps the weights back to CPU RAM. Compatible with all PyTorch and Hugging Face architectures.
+    Supports autograd backward offloading via input/output gates during training.
     """
     def __init__(self, original_layer, execution_device="cuda"):
         super().__init__()
@@ -20,22 +43,30 @@ class OffloadedLayerWrapper(nn.Module):
         self.execution_device = torch.device(execution_device)
 
     def forward(self, *args, **kwargs):
-        # 1. Swap current layer parameters to VRAM
+        # 1. Input Gate: Apply input hook during training to trigger offloading to CPU on backward exit
+        new_args = args
+        if self.training and len(args) > 0 and isinstance(args[0], torch.Tensor) and args[0].requires_grad:
+            new_args = (OffloadInputHook.apply(args[0], self.layer),) + args[1:]
+            
+        # 2. Swap current layer parameters to GPU
         self.layer.to(self.execution_device)
         
-        # 2. Transfer all input tensors (including nested tuples/lists) to execution device
+        # 3. Transfer all input tensors to execution device
         from offloader import recursive_to_device
-        new_args = tuple(recursive_to_device(x, self.execution_device) for x in args)
-        new_kwargs = {k: recursive_to_device(v, self.execution_device) for k, v in kwargs.items()}
+        dev_args = tuple(recursive_to_device(x, self.execution_device) for x in new_args)
+        dev_kwargs = {k: recursive_to_device(v, self.execution_device) for k, v in kwargs.items()}
         
-        # 3. Execute the actual forward step on GPU
-        output = self.layer(*new_args, **new_kwargs)
+        # 4. Execute the actual forward step on GPU
+        output = self.layer(*dev_args, **dev_kwargs)
         
-        # 4. Offload layer back to CPU ONLY in evaluation mode
-        if not self.training:
+        # 5. Output Gate: Apply output hook during training to trigger loading to GPU on backward entry
+        if self.training and isinstance(output, torch.Tensor) and output.requires_grad:
+            output = OffloadOutputHook.apply(output, self.layer, self.execution_device)
+        else:
+            # During evaluation (inference) or if output doesn't require grad, immediately offload to CPU
             self.layer.to("cpu", non_blocking=True)
             
-        # 5. Ensure that all output tensors remain on execution device
+        # 6. Ensure that all output tensors remain on execution device
         return recursive_to_device(output, self.execution_device)
 
 class AudioTokenFlowTokenizer(nn.Module):
