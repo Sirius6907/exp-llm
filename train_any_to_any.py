@@ -118,7 +118,7 @@ def train_any_to_any_one_epoch():
     # 1. Instantiate Orchestrator
     orchestrator = AnyToAnyOrchestrator(
         codebook_size=2048,
-        vlm_dim=1536,
+        vlm_dim=2048,
         dit_dim=1024,
         latent_dim=256,
         vocab_size=32000,

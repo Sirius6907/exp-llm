@@ -13,7 +13,7 @@ def test_any_to_any():
     # 1. Initialize Any-to-Any Orchestrator
     orchestrator = AnyToAnyOrchestrator(
         codebook_size=4096,
-        vlm_dim=1536,
+        vlm_dim=2048,
         dit_dim=1024,
         latent_dim=256,
         vocab_size=32000,

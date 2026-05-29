@@ -149,12 +149,115 @@ class BonsaiAudioMock(nn.Module):
         out = self.audio_transformer(out)
         return out
 
+class Heavy2BTransformerLayer(nn.Module):
+    """
+    A high-capacity transformer layer simulating ~50M parameters.
+    Consists of self-attention projections and a SwiGLU MLP.
+    """
+    def __init__(self, dim=2048, hidden_dim=5460):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        # Self-Attention projection weights: ~16.7M parameters
+        self.qkv_proj = nn.Linear(dim, dim * 3, bias=False)
+        self.out_proj = nn.Linear(dim, dim, bias=False)
+        
+        self.norm2 = nn.LayerNorm(dim)
+        # SwiGLU MLP: ~33.5M parameters (Gate + Up, then Down)
+        self.gate_proj = nn.Linear(dim, hidden_dim, bias=False)
+        self.up_proj = nn.Linear(dim, hidden_dim, bias=False)
+        self.down_proj = nn.Linear(hidden_dim, dim, bias=False)
+
+    def forward(self, x):
+        # 1. Attention residual
+        x_norm = self.norm1(x)
+        qkv = self.qkv_proj(x_norm)
+        q, k, v = torch.chunk(qkv, 3, dim=-1)
+        # Simple simulated attention context blending
+        attn_out = self.out_proj(q * torch.sigmoid(k).mean(dim=1, keepdim=True))
+        x = x + attn_out
+        
+        # 2. SwiGLU FFN residual
+        x_norm2 = self.norm2(x)
+        swiglu = F.silu(self.gate_proj(x_norm2)) * self.up_proj(x_norm2)
+        ffn_out = self.down_proj(swiglu)
+        x = x + ffn_out
+        return x
+
+class Heavy2BTransformer(nn.Module):
+    """
+    Consolidated 2 Billion parameter transformer backbone (40 offloaded layers).
+    Applies gradient checkpointing per layer block during backpropagation to prevent
+    VRAM spikes under 3GB constraints.
+    """
+    def __init__(self, dim=2048, hidden_dim=5460, num_layers=40, execution_device="cuda"):
+        super().__init__()
+        self.dim = dim
+        self.num_layers = num_layers
+        self.execution_device = torch.device(execution_device)
+        
+        # Wrap each of the 40 layers inside OffloadedLayerWrapper
+        self.layers = nn.ModuleList([
+            OffloadedLayerWrapper(
+                Heavy2BTransformerLayer(dim=dim, hidden_dim=hidden_dim),
+                execution_device=self.execution_device
+            ) for _ in range(num_layers)
+        ])
+
+    def forward(self, text_tokens=None, visual_latents=None):
+        # 1. Determine batch and sequence lengths dynamically
+        if text_tokens is not None:
+            B, S = text_tokens.shape
+        elif visual_latents is not None:
+            if len(visual_latents.shape) == 4:
+                B, D_lat, H, W = visual_latents.shape
+                S = H * W
+            else:
+                # Handle flattened 1D audio shapes or intermediate embeddings
+                B, S, D_lat = visual_latents.shape
+        else:
+            B, S = 1, 512
+            
+        device = text_tokens.device if text_tokens is not None else (visual_latents.device if visual_latents is not None else self.execution_device)
+        
+        # 2. Create initial state
+        x = torch.zeros(B, S, self.dim, device=device)
+        if visual_latents is not None:
+            if len(visual_latents.shape) == 4:
+                flat_visual = visual_latents.permute(0, 2, 3, 1).reshape(B, S, -1)
+            else:
+                flat_visual = visual_latents
+            if flat_visual.shape[-1] != self.dim:
+                proj = nn.Linear(flat_visual.shape[-1], self.dim, device=device)
+                x = x + proj(flat_visual)
+            else:
+                x = x + flat_visual
+                
+        # 3. Layer-by-layer forward execution with dynamic offloading and gradient checkpointing
+        hidden_states = []
+        for layer in self.layers:
+            # Transfer execution device configuration dynamically
+            layer.execution_device = self.execution_device
+            
+            # Apply PyTorch activation checkpointing to prevent activation VRAM growth
+            if self.training:
+                # Define a wrapper function for checkpoint
+                def run_layer(layer_inputs):
+                    return layer(layer_inputs)
+                x = torch.utils.checkpoint.checkpoint(run_layer, x, use_reentrant=False)
+            else:
+                x = layer(x)
+                
+            hidden_states.append(x)
+            
+        return hidden_states
+
 class AnyToAnyOrchestrator(nn.Module):
     """
     Any-to-Any Multimodal Generative Orchestrator supporting all 16 routing pathways
     between Text, Image, Video, and Audio under a strict 3GB VRAM ceiling.
+    Scales to 2 Billion parameter backbone using CPU weight swapping.
     """
-    def __init__(self, codebook_size=4096, vlm_dim=1536, dit_dim=1024, latent_dim=256, vocab_size=32000, device="cpu"):
+    def __init__(self, codebook_size=4096, vlm_dim=2048, dit_dim=1024, latent_dim=256, vocab_size=32000, device="cpu"):
         super().__init__()
         self.device = torch.device(device)
         self.latent_dim = latent_dim
@@ -186,14 +289,17 @@ class AnyToAnyOrchestrator(nn.Module):
             state_dim=16
         ).to(self.device)
         
-        # 4. Heavy models wrapped in OffloadedLayerWrapper to target the 3GB VRAM limit
-        self.vlm = OffloadedLayerWrapper(
-            MiniCPMSALAMock(vlm_dim=vlm_dim, num_layers=4),
+        # 4. Massive 2B parameter VLM backbone consisting of 40 offloaded SwiGLU layers
+        self.vlm = Heavy2BTransformer(
+            dim=vlm_dim,
+            hidden_dim=5460,
+            num_layers=40,
             execution_device=self.device
         )
         
+        # 5. Connectors & Decoders wrapped in OffloadedLayerWrapper
         self.mcp = OffloadedLayerWrapper(
-            MobileConditioningProjector(vlm_dim=vlm_dim, dit_dim=dit_dim, num_layers=4),
+            MobileConditioningProjector(vlm_dim=vlm_dim, dit_dim=dit_dim, num_layers=40),
             execution_device=self.device
         )
         
@@ -207,7 +313,7 @@ class AnyToAnyOrchestrator(nn.Module):
             execution_device=self.device
         )
         
-        print(f"[AnyToAnyOrchestrator] Any-to-Any routing engine initialized on device {self.device}.")
+        print(f"[AnyToAnyOrchestrator] Any-to-Any 2B-Scale engine initialized on device {self.device}.")
 
     def to(self, device):
         device = torch.device(device)
