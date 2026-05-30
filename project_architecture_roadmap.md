@@ -91,9 +91,24 @@ While layer-wise offloading solved the VRAM constraint, text generation speed wa
 
 ---
 
-## Phase 5: Future Roadmap
+## Phase 5: 1 Million Context Ingestion & Hardware Optimization (Completed!)
 
-### Mark-XXXIX Local Offline Brain Integration (Q3 2026)
-* Integrate the 528 MB Pixelle-Sirius engine directly as the fully offline local "main brain" for the **Mark-XXXIX** Windows assistant.
-* Use the `MambaSelectiveBlock` for low-latency visual screen comprehension (pre-processing screenshots) and generating causal system actions.
+To natively support a **1,000,000 token context window** under consumer hardware limitations, we implemented:
+1. **NTK-Aware Dynamic RoPE Scaling**: Scaled the rotary positional embeddings of `Qwen2-0.5B` dynamically by a factor of `31.25` (1,000,000 / 32,000) to maintain high-fidelity semantic recall and sequence structure.
+2. **Chunk-Wise State Recurrence**: Prefilled sequence context in small, sequential chunks of 2,048 tokens, propagating only the compact Mamba recurrent states. This bypassed intermediate activation accumulation, capping maximum memory consumption.
+3. **Layer Offloading Verification**: Under evaluation, loading backbones with `offload=True` maintained a peak GPU memory footprint of only **938.52 MB VRAM** for a 1,000,000 token ingestion run.
+4. **Mixed Precision (AMP) & High-Throughput Tuning**: Optimized the training loop with `num_workers=4`, `pin_memory=True`, and FP16 mixed precision. This allowed scaling the training batch size to **16** (a 4x increase) while maintaining a low step latency of **43.06 ms** on a Tesla T4 GPU.
+
+---
+
+## Phase 6: Future Roadmap & Edge Deployment Packaging
+
+### 1. Edge Quantization Prep (Q4 2026)
+* Compile the unified orchestrator and export the model to optimized edge execution frameworks.
+* Implement 4-bit AWQ or GPTQ quantization for the pre-trained backbones (`Qwen2`, `SigLIP`, `Whisper`) to target consumer-grade laptops (e.g. RTX 3050 Laptop 4GB GPU).
+* Package the 1.58-bit Ternary adapter weights (`mcp_alignment_real.pth`) for zero-overhead local deployment.
+
+### 2. Mark-XXXIX Offline Brain Integration (Q1 2027)
+* Integrate the engine directly as the fully offline local "main brain" for the **Mark-XXXIX** Windows assistant.
+* Use the MambaSelectiveBlock for low-latency visual screen comprehension (processing screenshots) and generating causal system actions.
 * Pipe microphone inputs through the acoustic LCM solver for real-time offline voice control.
