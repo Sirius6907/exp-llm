@@ -67,9 +67,14 @@ def run_real_prediction_pipeline():
     
     t0 = time.time()
     with torch.no_grad():
-        # Project our image latent (generated in Route 1) to act as visual inputs
-        projected_latents = orchestrator.image_encoder(image_latents) # (1, 256, 2048)
-        visual_inputs = projected_latents[:, :16, :] # (1, 16, 2048)
+        # Flatten spatial aspect ratio dimensions if image_latents is 4D (B, H, W, D)
+        if len(image_latents.shape) == 4:
+            B_img, H_img, W_img, D_img = image_latents.shape
+            flat_latents = image_latents.view(B_img, H_img * W_img, D_img)
+        else:
+            flat_latents = image_latents
+        projected_latents = orchestrator.image_encoder(flat_latents)
+        visual_inputs = projected_latents[:, :16, :]
         
         # Project through MCP
         conditioning_c = orchestrator.mcp(visual_inputs)

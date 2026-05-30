@@ -70,7 +70,13 @@ def test_4bit_quantization_inference():
     print("\n--- Route 2: IMAGE-TO-VIDEO ---")
     t0 = time.time()
     with torch.no_grad():
-        projected_latents = orchestrator.image_encoder(image_latents)
+        # Flatten spatial aspect ratio dimensions if image_latents is 4D (B, H, W, D)
+        if len(image_latents.shape) == 4:
+            B_img, H_img, W_img, D_img = image_latents.shape
+            flat_latents = image_latents.view(B_img, H_img * W_img, D_img)
+        else:
+            flat_latents = image_latents
+        projected_latents = orchestrator.image_encoder(flat_latents)
         visual_inputs = projected_latents[:, :16, :]
         conditioning_c = orchestrator.mcp(visual_inputs)
         video_latents, latency = orchestrator.consistency_generate(
