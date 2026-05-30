@@ -101,8 +101,9 @@ class MarkXXXIXAssistantBrain(nn.Module):
         # audio_waveform should be a 1D numpy array or tensor (16kHz mono)
         inputs = self.orchestrator.real_whisper_processor(audio_waveform, sampling_rate=16000, return_tensors="pt")
         input_features = inputs["input_features"].to(self.device)
-        if input_features.dtype != torch.float16 and self.device.type == "cuda":
-            input_features = input_features.to(torch.float16)
+        # Keep as float32 to avoid Conv1d bias precision mismatch in 4-bit mode
+        if self.device.type == "cuda":
+            input_features = input_features.float()
             
         with torch.no_grad():
             outputs = self.orchestrator.real_whisper.encoder(input_features=input_features)
