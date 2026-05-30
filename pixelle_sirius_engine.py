@@ -542,7 +542,6 @@ class PixelleSiriusOrchestrator(nn.Module):
         # 1. Prefill / Process sequentially in small activation-capped chunks
         draft_state = None
         target_states = [None, None, None]
-        outputs = []
         
         for i in range(0, S, chunk_size):
             chunk = input_ids[:, i : i + chunk_size]
@@ -556,9 +555,7 @@ class PixelleSiriusOrchestrator(nn.Module):
             with torch.no_grad():
                 out_draft, draft_state = self.draft_vlm(x_chunk_h, state=draft_state)
                 out_target, target_states = self.router(x_chunk_h, self.experts, states=target_states)
-                
-            outputs.append(out_target.cpu()) # Offload outputs to CPU host memory to keep VRAM strictly capped!
             
         print(f"[Phase 5] Long context prefill successfully completed. Final state initialized.")
-        return torch.cat(outputs, dim=1), draft_state, target_states
+        return draft_state, target_states
 
