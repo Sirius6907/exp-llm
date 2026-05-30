@@ -37,7 +37,7 @@ class MambaSelectiveBlock(nn.Module):
             state: Optional cached recurrent state of shape (B, D, state_dim)
         Returns:
             If state is None: output tensor (B, S, D), final_state (B, D, state_dim)
-            If state is not None: (output tensor (B, 1, D), new_state (B, D, state_dim))
+            If state is not None: (output tensor (B, S, D), new_state (B, D, state_dim))
         """
         B, S, D = x.shape
         
@@ -54,19 +54,25 @@ class MambaSelectiveBlock(nn.Module):
         
         # 3. Recurrent Scan / Step
         if state is not None:
-            # Incremental step mode (S = 1)
+            # Incremental step mode
             h = state # (B, D, state_dim)
-            dt_s = dt[:, 0].unsqueeze(-1) # (B, D, 1)
-            B_s = B_raw[:, 0].unsqueeze(1) # (B, 1, state_dim)
-            C_s = C_raw[:, 0].unsqueeze(-1) # (B, state_dim, 1)
-            u_s = x_branch[:, 0].unsqueeze(-1) # (B, D, 1)
+            outputs = []
             
-            bar_A = torch.exp(dt_s * A.unsqueeze(0))
-            bar_B = dt_s * B_s
-            h = bar_A * h + bar_B * u_s
-            
-            y_s = torch.bmm(h, C_s).squeeze(-1).unsqueeze(1) # (B, 1, D)
-            blended = self.norm(y_s * F.silu(gate_branch))
+            for s in range(S):
+                dt_s = dt[:, s].unsqueeze(-1) # (B, D, 1)
+                B_s = B_raw[:, s].unsqueeze(1) # (B, 1, state_dim)
+                C_s = C_raw[:, s].unsqueeze(-1) # (B, state_dim, 1)
+                u_s = x_branch[:, s].unsqueeze(-1) # (B, D, 1)
+                
+                bar_A = torch.exp(dt_s * A.unsqueeze(0))
+                bar_B = dt_s * B_s
+                h = bar_A * h + bar_B * u_s
+                
+                y_s = torch.bmm(h, C_s).squeeze(-1) # (B, D)
+                outputs.append(y_s)
+                
+            ssm_out = torch.stack(outputs, dim=1) # (B, S, D)
+            blended = self.norm(ssm_out * F.silu(gate_branch))
             out = self.out_proj(blended)
             return out, h
         else:
@@ -94,7 +100,7 @@ class MambaSelectiveBlock(nn.Module):
 
 class SparseMoERouter(nn.Module):
     """
-    Gated Sparse Mixture of Experts (MoE) Top-1 Router.
+    Gated Sparse Mixture of Experts (MoE) Top-1 Router with state caching support.
     Routes incoming features dynamically to one of the specialized expert models,
     keeping active execution parameters strictly optimized while expanding learning capacity.
     """
@@ -104,11 +110,12 @@ class SparseMoERouter(nn.Module):
         self.num_experts = num_experts
         self.gate = nn.Linear(dim, num_experts, bias=False)
 
-    def forward(self, x, experts):
+    def forward(self, x, experts, states=None):
         """
         Args:
             x: Input features of shape (B, S, D)
             experts: nn.ModuleList containing expert blocks
+            states: Optional list of expert cached states of shape (B, D, state_dim)
         """
         B, S, D = x.shape
         flat_x = x.view(-1, D) # (B * S, D)
@@ -122,21 +129,34 @@ class SparseMoERouter(nn.Module):
         
         # 2. Gather outputs from experts dynamically
         out_flat = torch.zeros_like(flat_x)
+        new_states = [] if states is not None else None
         
         for exp_idx in range(self.num_experts):
             # Mask of tokens assigned to this expert
             token_mask = (top1_indices == exp_idx)
+            
+            # Retrieve previous expert state if provided
+            prev_state = states[exp_idx] if states is not None else None
+            new_state = prev_state
+            
             if token_mask.any():
                 expert_inputs = flat_x[token_mask] # (N_tokens, D)
                 expert_inputs_reshaped = expert_inputs.unsqueeze(0) # (1, N_tokens, D)
                 
                 # Execute selected expert
-                expert_out, _ = experts[exp_idx](expert_inputs_reshaped)
+                if prev_state is not None:
+                    expert_out, new_state = experts[exp_idx](expert_inputs_reshaped, state=prev_state)
+                else:
+                    expert_out, new_state = experts[exp_idx](expert_inputs_reshaped)
+                    
                 expert_out = expert_out.squeeze(0) # (N_tokens, D)
-                
-                # Scale by routing probability
                 out_flat[token_mask] = expert_out * top1_probs[token_mask].unsqueeze(-1)
                 
+            if new_states is not None:
+                new_states.append(new_state)
+                
+        if new_states is not None:
+            return out_flat.view(B, S, D), new_states
         return out_flat.view(B, S, D)
 
 class ConsistencyDenoisingSolver(nn.Module):
@@ -239,7 +259,8 @@ class PixelleSiriusOrchestrator(nn.Module):
     def speculative_text_gen(self, prompt_tokens, steps=50, K_draft=4):
         """
         Executes Speculative Drafting to generate text/code at 100-120 tokens/sec.
-        Leverages Mamba recurrent state caching to achieve O(1) step latency.
+        Leverages Mamba recurrent state caching in both draft and target models
+        to achieve O(1) step latency throughout sequence extension.
         """
         B = prompt_tokens.shape[0]
         generated = prompt_tokens.clone()
@@ -247,11 +268,12 @@ class PixelleSiriusOrchestrator(nn.Module):
         tokens_produced = 0
         t_start = time.time()
         
-        # 1. Prefill Phase: Initialize Mamba draft state with prompt hidden representation
+        # 1. Prefill Phase: Initialize Mamba draft and target states with prompt
         x_prompt_h = torch.zeros(B, prompt_tokens.shape[1], self.vlm_dim, device=self.device)
         x_prompt_h[:, :, 0] = prompt_tokens.float()
         
         _, draft_state = self.draft_vlm(x_prompt_h)
+        _, target_states = self.router(x_prompt_h, self.experts, states=[None, None, None])
         
         # Loop for sequence extension
         while tokens_produced < steps:
@@ -275,14 +297,14 @@ class PixelleSiriusOrchestrator(nn.Module):
                 
             draft_block = torch.cat(draft_candidates, dim=1) # (B, K_draft)
             
-            # 3. Parallel Target Verification Phase: Verify candidate block in 1 parallel target pass
-            candidates_full = torch.cat([generated, draft_block], dim=1)
-            x_target_h = torch.zeros(B, candidates_full.shape[1], self.vlm_dim, device=self.device)
-            x_target_h[:, :, 0] = candidates_full.float()
+            # 3. Parallel Target Verification Phase: Verify candidate block using cached target states
+            # We ONLY pass the K_draft candidates through the target experts using the cached target_states
+            x_target_step_h = torch.zeros(B, K_draft, self.vlm_dim, device=self.device)
+            x_target_step_h[:, :, 0] = draft_block.float()
             
-            # Sparse MoE Routing in parallel
-            target_states = self.router(x_target_h, self.experts)
-            target_logits = self.text_head(target_states[:, -(K_draft+1):-1]) # (B, K_draft, vocab_size)
+            # Single-step Mamba recurrent update over candidates using cached target states
+            target_states_out, step_target_states = self.router(x_target_step_h, self.experts, states=target_states)
+            target_logits = self.text_head(target_states_out) # (B, K_draft, vocab_size)
             target_preds = torch.argmax(target_logits, dim=-1) # (B, K_draft)
             
             # Check draft acceptance indices
@@ -303,6 +325,9 @@ class PixelleSiriusOrchestrator(nn.Module):
             x_update_h = torch.zeros(B, new_tokens.shape[1], self.vlm_dim, device=self.device)
             x_update_h[:, :, 0] = new_tokens.float()
             _, draft_state = self.draft_vlm(x_update_h, state=draft_state)
+            
+            # Update the target_states to match the accepted tokens
+            _, target_states = self.router(x_update_h, self.experts, states=target_states)
             
             tokens_produced += num_accepted + 1
             
