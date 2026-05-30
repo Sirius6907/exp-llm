@@ -18,9 +18,11 @@ class SelectiveSSM(nn.Module):
         
         # Parameter B and C projections (dynamic selective parameters)
         self.x_proj = nn.Linear(dim, dt_rank + state_dim * 2, bias=False)
+        nn.init.normal_(self.x_proj.weight, std=0.005) # Initialize with small weights to prevent representation drift
         
         # Step size (dt) projections and bias initialization
         self.dt_proj = nn.Linear(dt_rank, dim, bias=True)
+        nn.init.constant_(self.dt_proj.weight, 0.0) # Zero-initialize weights so dt starts as stable constant bias
         # Initialize dt_proj bias to ensure step size starts in a stable regime
         nn.init.constant_(self.dt_proj.bias, 0.1)
 
@@ -104,6 +106,9 @@ class TemporalWedgeBlock(nn.Module):
             nn.GELU(),
             nn.Linear(dim * 2, dim)
         )
+        # Zero-initialize the final projection layer to enforce near-zero representation loss on step 0
+        nn.init.constant_(self.ffn[2].weight, 0.0)
+        nn.init.constant_(self.ffn[2].bias, 0.0)
 
     def forward(self, x, prev_state=None):
         # 1. Apply Selective SSM recurrent step
