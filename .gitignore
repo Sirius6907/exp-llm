@@ -8,3 +8,7 @@ env/
 venv/
 .git/
 .ipynb_checkpoints/
+*.pth
+*.png
+*.gif
+*.wav
