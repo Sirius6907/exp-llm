@@ -34,7 +34,7 @@ class MarkXXXIXAssistantBrain(nn.Module):
         # Cross-modal projection layers to map pre-trained visual/acoustic features to Qwen2 space
         # Qwen2-0.5B hidden size is 896
         self.qwen_dim = 896
-        self.vision_projector = nn.Linear(768, self.qwen_dim).to(self.device)
+        self.vision_projector = nn.Linear(self.orchestrator.vlm_dim, self.qwen_dim).to(self.device)
         self.audio_projector = nn.Linear(384, self.qwen_dim).to(self.device)
         
     def capture_screen(self):
