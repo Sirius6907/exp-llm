@@ -270,7 +270,59 @@ class PixelleSiriusOrchestrator(nn.Module):
         self.audio_encoder = nn.Linear(latent_dim, vlm_dim).to(self.device)
         self.audio_decoder = nn.Linear(latent_dim, latent_dim).to(self.device)
         
+        # 3. Real Pre-trained Backbones (Phase 4 Integration)
+        self.real_weights_enabled = False
+        self.real_qwen = None
+        self.real_siglip = None
+        self.real_whisper = None
+        self.real_tokenizer = None
+        self.real_siglip_processor = None
+        self.real_whisper_processor = None
+        
         print(f"[PixelleSiriusOrchestrator] Unified SSM-Diffusion Engine initialized on {self.device}.")
+
+    def load_real_backbones(self, qwen_id="Qwen/Qwen2-0.5B", siglip_id="google/siglip-base-patch16-224", whisper_id="openai/whisper-tiny"):
+        """
+        Loads actual pre-trained backbones from Hugging Face,
+        wrapping their layers in OffloadedLayerWrapper to operate under 1.5 GB VRAM limits.
+        """
+        try:
+            from transformers import AutoModel, AutoTokenizer, AutoProcessor
+            from any_to_any import OffloadedLayerWrapper
+            print(f"\n[Real Weight Integration] Initializing pre-trained Hugging Face backbones...")
+            
+            # Load and wrap Qwen2
+            print(f"Loading {qwen_id} on CPU memory...")
+            self.real_tokenizer = AutoTokenizer.from_pretrained(qwen_id)
+            self.real_qwen = AutoModel.from_pretrained(qwen_id, torch_dtype=torch.float16)
+            if hasattr(self.real_qwen, "layers"):
+                wrapped_layers = [OffloadedLayerWrapper(layer, execution_device=self.device) for layer in self.real_qwen.layers]
+                self.real_qwen.layers = nn.ModuleList(wrapped_layers)
+                print(f"Wrapped Qwen2 decoder blocks with dynamic offloader.")
+                
+            # Load and wrap SigLIP
+            print(f"Loading {siglip_id} on CPU memory...")
+            self.real_siglip_processor = AutoProcessor.from_pretrained(siglip_id)
+            self.real_siglip = AutoModel.from_pretrained(siglip_id, torch_dtype=torch.float16)
+            if hasattr(self.real_siglip.vision_model, "encoder") and hasattr(self.real_siglip.vision_model.encoder, "layers"):
+                wrapped_layers = [OffloadedLayerWrapper(layer, execution_device=self.device) for layer in self.real_siglip.vision_model.encoder.layers]
+                self.real_siglip.vision_model.encoder.layers = nn.ModuleList(wrapped_layers)
+                print(f"Wrapped SigLIP encoder blocks with dynamic offloader.")
+                
+            # Load and wrap Whisper
+            print(f"Loading {whisper_id} on CPU memory...")
+            self.real_whisper_processor = AutoProcessor.from_pretrained(whisper_id)
+            self.real_whisper = AutoModel.from_pretrained(whisper_id, torch_dtype=torch.float16)
+            if hasattr(self.real_whisper.encoder, "layers"):
+                wrapped_layers = [OffloadedLayerWrapper(layer, execution_device=self.device) for layer in self.real_whisper.encoder.layers]
+                self.real_whisper.encoder.layers = nn.ModuleList(wrapped_layers)
+                print(f"Wrapped Whisper encoder blocks with dynamic offloader.")
+                
+            self.real_weights_enabled = True
+            print("[OK] Real weights loaded and integrated successfully.")
+        except Exception as e:
+            print(f"[FAIL] Could not load real pre-trained weights: {e}")
+            print("Running in synthetic simulation fallback mode.")
 
     def speculative_text_gen(self, prompt_tokens, steps=50, K_draft=4):
         """
