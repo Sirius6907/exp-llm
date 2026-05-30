@@ -56,8 +56,24 @@ class MambaSelectiveBlock(nn.Module):
         if state is not None:
             # Incremental step mode
             h = state # (B, D, state_dim)
-            outputs = []
             
+            if S == 1:
+                # Fast path for single step: bypass loop entirely!
+                dt_s = dt[:, 0].unsqueeze(-1) # (B, D, 1)
+                B_s = B_raw[:, 0].unsqueeze(1) # (B, 1, state_dim)
+                C_s = C_raw[:, 0].unsqueeze(-1) # (B, state_dim, 1)
+                u_s = x_branch[:, 0].unsqueeze(-1) # (B, D, 1)
+                
+                bar_A = torch.exp(dt_s * A.unsqueeze(0))
+                bar_B = dt_s * B_s
+                h = bar_A * h + bar_B * u_s
+                
+                y_s = torch.bmm(h, C_s).squeeze(-1).unsqueeze(1) # (B, 1, D)
+                blended = self.norm(y_s * F.silu(gate_branch))
+                out = self.out_proj(blended)
+                return out, h
+                
+            outputs = []
             for s in range(S):
                 dt_s = dt[:, s].unsqueeze(-1) # (B, D, 1)
                 B_s = B_raw[:, s].unsqueeze(1) # (B, 1, state_dim)
