@@ -89,12 +89,24 @@ def train_real_mcp_adapter():
     ).to(device)
     mcp_projector.train()
     
-    # 4. Setup Dataloader and Optimizer
+    # 4. Setup Dataloader, Optimizer and AMP GradScaler
     dataset = RealTextPromptDataset()
-    dataloader = DataLoader(dataset, batch_size=4, shuffle=True)
+    # Multiply prompts to simulate a larger dataset for high-throughput pipeline testing
+    dataset.prompts = dataset.prompts * 32  # 16 * 32 = 512 samples
+    
+    # Maximize CPU and RAM utilization by using multiple workers and memory pinning
+    dataloader = DataLoader(
+        dataset, 
+        batch_size=16, 
+        shuffle=True, 
+        num_workers=4, 
+        pin_memory=True, 
+        persistent_workers=True
+    )
     
     # Only optimize MCP parameters
     optimizer = optim.AdamW(mcp_projector.parameters(), lr=2e-4, weight_decay=1e-2)
+    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
     
     # 5. Teacher Model Target Simulator
     # Fuses visual-semantic text alignment targets (representing ideal T5/CLIP features)
@@ -122,28 +134,32 @@ def train_real_mcp_adapter():
             input_ids = inputs["input_ids"].to(device)
             B, S = input_ids.shape
             
-            # 1. Forward Pass through Frozen Qwen2 to extract hidden states
-            with torch.no_grad():
-                out_hf = orchestrator.real_qwen(input_ids=input_ids, output_hidden_states=True)
-                # Extract and cast last 4 hidden states to float32 to prevent dtype crashes
-                hidden_states = [h.float() for h in out_hf.hidden_states[-num_layers:]]
+            # Use Automatic Mixed Precision (AMP) to maximize Tensor Core utilization
+            with torch.cuda.amp.autocast(enabled=(device.type == "cuda"), dtype=torch.float16):
+                # 1. Forward Pass through Frozen Qwen2 to extract hidden states
+                with torch.no_grad():
+                    out_hf = orchestrator.real_qwen(input_ids=input_ids, output_hidden_states=True)
+                    # Extract and cast last 4 hidden states to float32 to prevent dtype crashes
+                    hidden_states = [h.float() for h in out_hf.hidden_states[-num_layers:]]
+                    
+                # 2. Forward pass through Ternary MCP (Gradients pass through custom STE)
+                projected_c = mcp_projector(hidden_states)
                 
-            # 2. Forward pass through Ternary MCP (Gradients pass through custom STE)
-            projected_c = mcp_projector(hidden_states)
+                # 3. Simulate target teacher embeddings to match projected_c shape exactly
+                target_c = torch.randn_like(projected_c)
+                
+                # 4. Compute alignment loss (MSE)
+                loss = F.mse_loss(projected_c, target_c)
+                
+            # 5. Backpropagate gradients exclusively through the MCP using GradScaler
+            scaler.scale(loss).backward()
             
-            # 3. Simulate target teacher embeddings to match projected_c shape exactly
-            target_c = torch.randn_like(projected_c)
-            
-            # 4. Compute alignment loss (MSE)
-            loss = F.mse_loss(projected_c, target_c)
-            
-            # 5. Backpropagate gradients exclusively through the MCP
-            loss.backward()
-            
-            # Clip gradients to enforce discrete weight stability
+            # Unscale for gradient clipping to enforce discrete weight stability
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(mcp_projector.parameters(), max_norm=1.0)
             
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             
             t1 = time.time()
             step_times.append((t1 - t0) * 1000)

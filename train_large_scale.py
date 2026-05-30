@@ -168,7 +168,7 @@ def train_large_scale():
         audio_dir=None
     )
     sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
-    dataloader = DataLoader(dataset, batch_size=2, sampler=sampler, pin_memory=True)
+    dataloader = DataLoader(dataset, batch_size=2, sampler=sampler, pin_memory=True, num_workers=4, persistent_workers=True)
     
     # 5. Optimizer & Mixed Precision Scaler
     optimizer = optim.AdamW(orchestrator.parameters(), lr=2e-4, weight_decay=1e-2)
