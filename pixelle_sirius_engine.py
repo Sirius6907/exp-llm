@@ -304,6 +304,7 @@ class PixelleSiriusOrchestrator(nn.Module):
             config.max_position_embeddings = 1000000
             config.rope_scaling = {
                 "type": "dynamic",
+                "rope_type": "dynamic",
                 "factor": 31.25 # Scale from 32,000 to 1,000,000 context
             }
             self.real_qwen = AutoModel.from_pretrained(qwen_id, config=config, torch_dtype=torch.float16)
