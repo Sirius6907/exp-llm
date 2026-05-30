@@ -369,7 +369,7 @@ class PixelleSiriusOrchestrator(nn.Module):
             for _ in range(steps):
                 with torch.no_grad():
                     out_hf = self.real_qwen(input_ids=input_ids)
-                    logits = out_hf.last_hidden_state[:, -1, :] # (B, hidden_dim)
+                    logits = out_hf.last_hidden_state[:, -1, :].float() # (B, hidden_dim)
                     if not hasattr(self, "real_text_head") or self.real_text_head.in_features != logits.shape[-1]:
                         self.real_text_head = nn.Linear(logits.shape[-1], self.vocab_size).to(self.device)
                     logits_projected = self.real_text_head(logits)
@@ -465,7 +465,7 @@ class PixelleSiriusOrchestrator(nn.Module):
             in_dim = conditioning_c.shape[-1] if conditioning_c is not None else self.vlm_dim
             if not hasattr(self, "real_mcp") or self.real_mcp.in_features != in_dim:
                 self.real_mcp = nn.Linear(in_dim, self.dit_dim).to(self.device)
-            context_h = conditioning_c if conditioning_c is not None else torch.randn(B, 16, in_dim, device=self.device)
+            context_h = conditioning_c.float() if conditioning_c is not None else torch.randn(B, 16, in_dim, device=self.device)
             cond_projected = self.real_mcp(context_h)
         else:
             context_h = conditioning_c if conditioning_c is not None else torch.randn(B, 16, self.vlm_dim, device=self.device)
