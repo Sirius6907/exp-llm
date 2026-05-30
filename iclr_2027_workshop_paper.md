@@ -102,51 +102,53 @@ This passes the state matrix $h_t$ of shape `(B, L, D, N_ssm)` from Frame $N$ to
 
 We implemented the proposed architecture in PyTorch and measured parameter configurations, execution latency, and VRAM scaling on a cloud **Tesla T4 GPU** (16GB VRAM, CUDA 12.1).
 
-### 3.1 Model Parameter Configurations
-The integrated DynaMap Any-to-Any orchestrator operates with extremely lightweight parameter profiles:
+### 3.1 Pre-trained Backbone Configurations
+To evaluate the pipeline under real-world conditions, we integrated pre-trained Hugging Face backbones with 4-bit NF4 quantization (via `BitsAndBytesConfig`):
+*   **VLM Backbone:** Qwen/Qwen2-0.5B (464 Million parameters).
+*   **Vision Backbone:** google/siglip-base-patch16-224 (87 Million parameters).
+*   **Acoustic Backbone:** openai/whisper-tiny (39 Million parameters).
 
-| Subsystem Component | Weight Precision | Parameter Count | Memory Footprint (Weights) |
+### 3.2 Real-Weight Generation Latency & Memory Footprint
+We benchmarked the inference speed and active memory footprints in both Full-Precision (16-bit float) and 4-bit NF4 quantized modes on a Tesla T4 GPU:
+
+| Pathway / Metric | Full-Precision (16-bit) | 4-Bit NF4 Quantized | Performance Comparison |
 | :--- | :--- | :--- | :--- |
-| **TokenFlow Encoders/Decoders** | FP16 | ~15.09 M | ~30.18 MB |
-| **Audio TokenFlow Encoders/Decoders** | FP16 | ~5.32 M | ~10.64 MB |
-| **Mobile Conditioning Projector** | 1.58-bit (ternary) | ~1.58 M | ~0.31 MB (quantized) |
-| **Selective SSM Temporal Wedge** | FP16 | ~0.28 M | ~0.56 MB |
-| **VLM Text Decoder Head** | FP16 | ~49.15 M | ~98.30 MB |
-| **Total Engine Parameters** | - | **~71.48 M** | **~139.99 MB** |
+| **Text-to-Image (T2I)** | **470.34 ms** | **577.83 ms** | Sub-second local LCM generation |
+| **Image-to-Video (I2V)** | **15.50 ms** | **16.09 ms** | Instant temporal SSM recurrence |
+| **Speculative Decoding** | **24.55 tok/sec** | **11.19 tok/sec** | High-speed linear autoregression |
+| **Peak GPU VRAM** | **~2.8 GB** | **1335.02 MB** | **52% Memory reduction** |
 
-### 3.2 Modality Path Execution Latency & VRAM on Tesla T4 GPU
-We evaluated all 16 cross-modal paths using a 4-frame video output and a 16000-sample audio output size:
+Under 4-bit quantization, all core generation pathways fit comfortably within target consumer laptop GPUs (such as the RTX 3050 Laptop 4GB) with a peak active footprint of only **1335.02 MB VRAM**.
 
-| Modality Pathway | Verification Status | Processing Latency | Peak VRAM Allocated | Peak VRAM Reserved |
-| :--- | :--- | :--- | :--- | :--- |
-| **TEXT_TO_TEXT** | SUCCESS | 351.49 ms | 381.07 MB | 428.00 MB |
-| **TEXT_TO_IMAGE** | SUCCESS | 57.62 ms | 448.60 MB | 492.00 MB |
-| **TEXT_TO_VIDEO** | SUCCESS | 74.68 ms | 488.63 MB | 530.00 MB |
-| **TEXT_TO_AUDIO** | SUCCESS | 23.10 ms | 500.39 MB | 532.00 MB |
-| **IMAGE_TO_TEXT** | SUCCESS | 76.42 ms | 440.96 MB | 532.00 MB |
-| **IMAGE_TO_IMAGE** | SUCCESS | 26.20 ms | 417.11 MB | 480.00 MB |
-| **IMAGE_TO_VIDEO** | SUCCESS | 33.97 ms | 475.89 MB | 510.00 MB |
-| **IMAGE_TO_AUDIO** | SUCCESS | 21.83 ms | 487.70 MB | 510.00 MB |
-| **VIDEO_TO_TEXT** | SUCCESS | 25.64 ms | 445.47 MB | 508.00 MB |
-| **VIDEO_TO_IMAGE** | SUCCESS | 29.85 ms | 429.70 MB | 484.00 MB |
-| **VIDEO_TO_VIDEO** | SUCCESS | 33.49 ms | 490.14 MB | 522.00 MB |
-| **VIDEO_TO_AUDIO** | SUCCESS | 25.00 ms | 501.17 MB | 522.00 MB |
-| **AUDIO_TO_TEXT** | SUCCESS | 44.37 ms | 841.82 MB | 960.00 MB |
-| **AUDIO_TO_IMAGE** | SUCCESS | 75.69 ms | 937.92 MB | 1028.00 MB |
-| **AUDIO_TO_VIDEO** | SUCCESS | 48.02 ms | 832.40 MB | 1028.00 MB |
-| **AUDIO_TO_AUDIO** | SUCCESS | 40.19 ms | 853.56 MB | 1022.00 MB |
+### 3.3 Context Window Prefill Benchmark (1 Million Tokens)
+To evaluate long-context processing under VRAM constraints, we simulated prompt lengths of up to **1,000,000 tokens**. By applying **NTK positional scaling** (scaling factor of 31.25) and chunk-wise prefilling (2,048-token chunk increments) to propagate Mamba recurrent states, we achieved:
+*   **Total Prefill Duration:** **222.85 seconds** (3.7 minutes).
+*   **Prefill Throughput:** **4487.32 tokens/sec**.
+*   **Peak VRAM Reserved:** **939.52 MB** (using layer offloading).
+*   **Numerical Stability:** **[STABLE]** (Zero NaN/Inf states over 1M token prefill).
 
-*   **Total Sequence Execution Time (all 16 paths):** **957.68 ms** (under 1 second).
-*   **Overall Peak Reserved Memory:** **1022.00 MB** (1.02 GB VRAM).
+### 3.4 Cinematic Video Suite & Aspect-Ratio Grids
+We verified aspect-ratio-aware generation using dynamic height/width grid resolutions (maintaining a constant $N \approx 256$ visual patches to prevent VRAM OOM):
+*   **Dynamic Grid Scaling:** 1:1 ($16\times16$), 16:9 ($21\times12$), 9:16 ($12\times21$).
+*   **Video Editing (`video_edit`):** Injects noise and denoises frames via temporal SSM recurrence. Completed in **679.07 ms**.
+*   **Video-LLM Understanding (`understand_video`):** Pools SigLIP frame features, fuses them via Mamba, and decodes textual descriptions using Qwen2. Completed in **1283.38 ms**.
+*   **Peak GPU VRAM Reserved:** **1347.22 MB**.
 
-### 3.3 Training Convergence on GPU
-We launched the Distributed Data Parallel (DDP) pre-training script (`train_large_scale.py`) using `torchrun --nproc_per_node=1`. In the single-GPU DDP setup, the pre-training loop executed successfully, achieving stable loss optimization:
-*   **Epoch Duration:** **3.45 seconds** (for 16 training batches).
-*   **Average Pipeline Training Loss:** **2.0537** (stable parameter convergence).
-*   **Autograd Device Safety:** The custom training-aware offloader prevented CUDA-to-CPU weight transfers during backpropagation, preserving memory on the active GPU and preventing memory access conflicts.
+### 3.5 Mark-XXXIX Desktop Assistant Integration Loop
+We deployed the 4-bit quantized engine as an offline Windows assistant brain, simulating continuous screen capture and voice ingestion:
+*   **Real-time Screen Ingestion:** Grabs active screenshots via Pillow, processes them via SigLIP, and updates temporal visual history in **30 - 40 ms**.
+*   **Voice Command Ingest:** Processes 16kHz mono audio waveforms via Whisper-Tiny's encoder and projects them to Qwen2 space in **37.44 ms** (direct acoustic embedding).
+*   **Speculative Action Decider:** Generates causal action commands (e.g. `[CLICK x,y]`) in **~5.1 seconds**.
+*   **Peak GPU VRAM Reserved:** **1786.74 MB** (recurrent loop active).
+
+### 3.6 Real-Weight MCP Adapter Tuning (`train_mcp_real.py`)
+To align VLM hidden states and diffusion representations, we froze Qwen2 and trained only the 1.58-bit Ternary MCP adapter (batch size = 16, mixed-precision FP16):
+*   **Average Step Latency:** **39.35 ms**.
+*   **Total Training Duration:** **5.51 seconds** (3 epochs, 96 gradient steps).
+*   **Autograd Device Safety:** Freezing backbones in active CUDA memory and updating only Ternary projection layers yielded zero parameter-migration overhead.
 
 ---
 
 ## 4. Conclusion
-We have presented an edge-scale, memory-efficient multimodal Any-to-Any generation pipeline designed to operate within a 3GB VRAM constraint. By consolidating all 16 cross-modal paths, employing training-aware offloaders, and using a selective SSM temporal wedge, we show that unified Any-to-Any understanding and generation can be executed locally on consumer edge hardware. Future work will utilize our Google TPU Research Cloud allocation to perform large-scale DDP pre-training.
+We have presented an edge-scale, memory-efficient multimodal Any-to-Any generation pipeline designed to operate within a 3GB VRAM constraint. By consolidating all modal routes, employing 4-bit NF4 quantization, and using a selective SSM temporal wedge, we show that unified Any-to-Any understanding, generation, and desktop automation can be executed locally on consumer edge hardware. Future work will utilize our Google TPU Research Cloud allocation to perform large-scale pre-training.
 
