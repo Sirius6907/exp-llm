@@ -128,11 +128,11 @@ def train_real_mcp_adapter():
                 # Extract and cast last 4 hidden states to float32 to prevent dtype crashes
                 hidden_states = [h.float() for h in out_hf.hidden_states[-num_layers:]]
                 
-            # 2. Simulate target teacher embeddings for cross-modal alignment
-            target_c = simulate_teacher_targets(B, S, device)
-            
-            # 3. Forward pass through Ternary MCP (Gradients pass through custom STE)
+            # 2. Forward pass through Ternary MCP (Gradients pass through custom STE)
             projected_c = mcp_projector(hidden_states)
+            
+            # 3. Simulate target teacher embeddings to match projected_c shape exactly
+            target_c = torch.randn_like(projected_c)
             
             # 4. Compute alignment loss (MSE)
             loss = F.mse_loss(projected_c, target_c)
