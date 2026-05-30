@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import time
 import math
 import random
+import re
 
 class MambaSelectiveBlock(nn.Module):
     """
@@ -521,13 +522,55 @@ class PixelleSiriusOrchestrator(nn.Module):
         
         return generated, tokens_produced, tokens_per_second
 
-    def consistency_generate(self, mode="image", conditioning_c=None, num_steps=2):
+    def parse_aspect_ratio(self, aspect_ratio_str="1:1", prompt=None):
+        """
+        Parses aspect ratio from a user-defined string or extracts it from prompt text.
+        Default options: 1:1, 16:9, 9:16, 4:3.
+        Supports custom string values like '3:2', '21:9', etc.
+        """
+        ratio_str = aspect_ratio_str.strip().lower()
+        
+        # Predefined aliases
+        aliases = {
+            "square": "1:1",
+            "widescreen": "16:9",
+            "portrait": "9:16",
+            "standard": "4:3",
+            "classic": "4:3"
+        }
+        
+        if ratio_str in aliases:
+            ratio_str = aliases[ratio_str]
+            
+        # Parse from prompt if requested
+        if ratio_str == "prompt" and prompt is not None:
+            match = re.search(r"(\d+(?:\.\d+)?):(\d+(?:\.\d+)?)", prompt)
+            if match:
+                ratio_str = f"{match.group(1)}:{match.group(2)}"
+            else:
+                ratio_str = "1:1" # Fallback to square
+                
+        # Parse width and height
+        try:
+            parts = ratio_str.split(":")
+            if len(parts) == 2:
+                w = float(parts[0])
+                h = float(parts[1])
+                return w, h
+        except Exception:
+            pass
+            
+        return 1.0, 1.0 # Default 1:1
+
+    def consistency_generate(self, mode="image", conditioning_c=None, num_steps=2, aspect_ratio="1:1", prompt=None):
         """
         Executes LCM multi-modal generation and editing in 1, 2, or 4 steps.
         Args:
             mode: Target modality ("image", "video", "audio")
             conditioning_c: Context conditioning from Mamba SSM states
             num_steps: Number of consistency steps (1, 2, or 4 steps)
+            aspect_ratio: Predefined or custom aspect ratio (e.g. '16:9', '1:1', etc.)
+            prompt: Text prompt context
         """
         B = 1
         t_start = time.time()
@@ -542,21 +585,42 @@ class PixelleSiriusOrchestrator(nn.Module):
         else:
             context_h = conditioning_c if conditioning_c is not None else torch.randn(B, 16, self.vlm_dim, device=self.device)
             cond_projected = self.mcp(context_h)
+            
+        # Parse aspect ratio values
+        w_r, h_r = self.parse_aspect_ratio(aspect_ratio, prompt)
         
         # 2. Consistency Denoising Steps based on Target Modality
         if mode == "image":
-            noise = torch.randn(B, 256, self.latent_dim, device=self.device)
+            # Dynamic grid size calculation: target ~256 patches
+            target_patches = 256
+            h_g = max(4, int(round((target_patches * h_r / w_r) ** 0.5)))
+            w_g = max(4, int(round(target_patches / h_g)))
+            L_seq = h_g * w_g
+            
+            print(f"[Aspect Ratio Resolution] '{aspect_ratio}' -> Grid: {w_g}x{h_g} ({L_seq} patches)")
+            
+            noise = torch.randn(B, L_seq, self.latent_dim, device=self.device)
             latents = self.lcm_solver(noise, cond_projected, num_steps=num_steps)
             output = self.image_decoder(latents)
+            # Reshape output to represent spatial dimensions
+            output = output.view(B, h_g, w_g, self.latent_dim)
             
         elif mode == "video":
+            # Dynamic grid size calculation: target ~256 patches
+            target_patches = 256
+            h_g = max(4, int(round((target_patches * h_r / w_r) ** 0.5)))
+            w_g = max(4, int(round(target_patches / h_g)))
+            L_seq = h_g * w_g
+            
+            print(f"[Aspect Ratio Resolution] Video Aspect Ratio: {w_r}:{h_r} -> Grid: {w_g}x{h_g} ({L_seq} patches)")
+            
             # Video frames are stacked latents
             frames = []
             for _ in range(4): # 4-frame video
-                noise = torch.randn(B, 256, self.latent_dim, device=self.device)
+                noise = torch.randn(B, L_seq, self.latent_dim, device=self.device)
                 frame_latent = self.lcm_solver(noise, cond_projected, num_steps=num_steps)
-                frames.append(self.image_decoder(frame_latent))
-            output = torch.stack(frames, dim=1)
+                frames.append(self.image_decoder(frame_latent).view(B, h_g, w_g, self.latent_dim))
+            output = torch.stack(frames, dim=1) # (B, 4, h_g, w_g, self.latent_dim)
             
         elif mode == "audio":
             noise = torch.randn(B, 2000, self.latent_dim, device=self.device)
@@ -570,6 +634,149 @@ class PixelleSiriusOrchestrator(nn.Module):
         latency = (t_end - t_start) * 1000
         
         return output, latency
+
+    def video_edit(self, input_video, prompt, edit_strength=0.5, num_steps=4):
+        """
+        Cinematic Precise Video Editing.
+        Adds controlled noise to the input video latents and denoises them conditioned on the edit prompt
+        using the Consistency Solver and Mamba-2 SSM temporal block.
+        """
+        t_start = time.time()
+        B = input_video.shape[0]
+        
+        # 1. Normalize shapes to (B, S_frames, L, D)
+        if len(input_video.shape) == 5:
+            B, S_frames, H, W, D = input_video.shape
+            x_input = input_video.view(B, S_frames, H * W, D)
+        else:
+            B, S_frames, L, D = input_video.shape
+            x_input = input_video
+            H = int(L ** 0.5)
+            W = L // H
+            
+        # 2. Extract text conditioning features using Qwen2 VLM
+        if self.real_weights_enabled:
+            inputs = self.real_tokenizer(prompt, return_tensors="pt")
+            input_ids = inputs["input_ids"].to(self.device)
+            with torch.no_grad():
+                out_hf = self.real_qwen(input_ids=input_ids)
+                text_features = out_hf.last_hidden_state.float() # (1, S_prompt, 896)
+            in_dim = text_features.shape[-1]
+            if not hasattr(self, "real_mcp") or self.real_mcp.in_features != in_dim:
+                self.real_mcp = nn.Linear(in_dim, self.dit_dim).to(self.device)
+            cond_projected = self.real_mcp(text_features)
+        else:
+            text_features = torch.randn(B, 16, self.vlm_dim, device=self.device)
+            cond_projected = self.mcp(text_features)
+            
+        # 3. Add noise scaled by edit_strength (beta)
+        beta = max(0.0, min(1.0, edit_strength))
+        noise = torch.randn_like(x_input)
+        x_noisy = math.sqrt(1 - beta) * x_input + math.sqrt(beta) * noise
+        
+        # 4. Sequential temporal consistency denoising pass
+        try:
+            from ssm_temporal import TemporalWedgeBlock
+        except ImportError:
+            pass
+            
+        if not hasattr(self, "temporal_fuser"):
+            self.temporal_fuser = TemporalWedgeBlock(dim=self.latent_dim, state_dim=16).to(self.device)
+            
+        edited_frames = []
+        ssm_state = None
+        
+        for t in range(S_frames):
+            frame_noise = x_noisy[:, t] # (B, L, D)
+            denoised_frame = self.lcm_solver(frame_noise, cond_projected, num_steps=num_steps)
+            denoised_frame = self.image_decoder(denoised_frame) # (B, L, D)
+            coherent_frame, ssm_state = self.temporal_fuser(denoised_frame, ssm_state)
+            edited_frames.append(coherent_frame.view(B, H, W, self.latent_dim))
+            
+        output = torch.stack(edited_frames, dim=1) # (B, S_frames, H, W, D)
+        t_end = time.time()
+        latency = (t_end - t_start) * 1000
+        
+        return output, latency
+
+    def understand_video(self, video_latents, prompt_text="Describe this video."):
+        """
+        Cinematic Precise Video Understanding (Video-LLM).
+        Ingests a sequence of video latents, fuses them temporally using Mamba-2 SSM block,
+        and feeds them to the real Qwen2 model to generate a textual description.
+        """
+        if not self.real_weights_enabled or self.real_qwen is None:
+            return "Video understanding requires real Qwen2 weights to be enabled.", 0.0
+            
+        t_start = time.time()
+        B = video_latents.shape[0]
+        
+        # 1. Normalize shapes to (B, S_frames, L, D)
+        if len(video_latents.shape) == 5:
+            B, S_frames, H, W, D = video_latents.shape
+            x_input = video_latents.view(B, S_frames, H * W, D)
+        else:
+            B, S_frames, L, D = video_latents.shape
+            x_input = video_latents
+            
+        # 2. Extract spatial-visual features for each frame using image_encoder
+        x_mapped = self.image_encoder(x_input) # (B, S_frames, L, vlm_dim)
+        
+        # 3. Aggregate spatial dimensions to get frame vectors
+        frame_vectors = x_mapped.mean(dim=2) # (B, S_frames, vlm_dim)
+        
+        # 4. Fuse frame vectors temporally using the draft_vlm Mamba-2 SSM
+        ssm_state = None
+        fused_frame_tokens = []
+        for t in range(S_frames):
+            frame_vector = frame_vectors[:, t:t+1] # (B, 1, vlm_dim)
+            fused_token, ssm_state = self.draft_vlm(frame_vector, state=ssm_state)
+            fused_frame_tokens.append(fused_token)
+            
+        video_tokens = torch.cat(fused_frame_tokens, dim=1) # (B, S_frames, vlm_dim)
+        
+        # 5. Map video tokens to the exact hidden dimensions of real Qwen2 (896)
+        if not hasattr(self, "real_mcp") or self.real_mcp.in_features != self.vlm_dim:
+            self.real_mcp = nn.Linear(self.vlm_dim, 896).to(self.device)
+        video_tokens_projected = self.real_mcp(video_tokens).half() # Cast to half for Qwen2
+        
+        # 6. Tokenize prompt text
+        inputs = self.real_tokenizer(prompt_text, return_tensors="pt")
+        input_ids = inputs["input_ids"].to(self.device) # (B, S_text)
+        
+        # Embed text inputs using real Qwen2 embedding layer
+        embed_tokens = self.real_qwen.embed_tokens
+        text_embeddings = embed_tokens(input_ids) # (B, S_text, 896)
+        
+        # 7. Combine Video Tokens and Text Embeddings
+        combined_embeddings = torch.cat([video_tokens_projected, text_embeddings], dim=1) # (B, S_frames + S_text, 896)
+        
+        # 8. Decode description using real Qwen2 causal backbone (up to 12 tokens)
+        with torch.no_grad():
+            out_hf = self.real_qwen(inputs_embeds=combined_embeddings)
+            logits = out_hf.last_hidden_state[:, -1, :].float()
+            
+            if not hasattr(self, "real_text_head") or self.real_text_head.in_features != logits.shape[-1]:
+                self.real_text_head = nn.Linear(logits.shape[-1], self.vocab_size).to(self.device)
+            logits_projected = self.real_text_head(logits)
+            
+            output_tokens = []
+            for _ in range(12):
+                next_token = torch.argmax(logits_projected, dim=-1, keepdim=True)
+                output_tokens.append(next_token.item())
+                
+                next_emb = embed_tokens(next_token)
+                combined_embeddings = torch.cat([combined_embeddings, next_emb], dim=1)
+                
+                out_hf = self.real_qwen(inputs_embeds=combined_embeddings)
+                logits = out_hf.last_hidden_state[:, -1, :].float()
+                logits_projected = self.real_text_head(logits)
+                
+        decoded_description = self.real_tokenizer.decode(output_tokens, skip_special_tokens=True)
+        t_end = time.time()
+        latency = (t_end - t_start) * 1000
+        
+        return f"Video analysis: {decoded_description}", latency
 
     def process_long_context(self, input_ids, chunk_size=2048):
         """
