@@ -42,6 +42,27 @@ class OffloadedLayerWrapper(nn.Module):
         self.layer = original_layer.to("cpu")
         self.execution_device = torch.device(execution_device)
 
+    def _apply(self, fn):
+        # 1. Temporarily detach self.layer to bypass recursive submodule processing by super()._apply
+        layer = self.layer
+        delattr(self, 'layer')
+        
+        # 2. Call super()._apply for other attributes
+        super()._apply(fn)
+        
+        # 3. Restore self.layer
+        self.layer = layer
+        
+        # 4. Apply the function to self.layer but force the output tensors to remain on CPU
+        def cpu_fn(t):
+            res = fn(t)
+            if res is not None and isinstance(res, torch.Tensor) and res.device.type != 'cpu':
+                return res.cpu()
+            return res
+            
+        self.layer._apply(cpu_fn)
+        return self
+
     def forward(self, *args, **kwargs):
         # 1. Input Gate: Apply input hook during training to trigger offloading to CPU on backward exit
         new_args = args
