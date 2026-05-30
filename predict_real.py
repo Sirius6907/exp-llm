@@ -68,7 +68,8 @@ def run_real_prediction_pipeline():
     t0 = time.time()
     with torch.no_grad():
         # Project our image latent (generated in Route 1) to act as visual inputs
-        visual_inputs = image_latents.mean(dim=1, keepdim=True).repeat(1, 16, orchestrator.vlm_dim) # (1, 16, 2048)
+        projected_latents = orchestrator.image_encoder(image_latents) # (1, 256, 2048)
+        visual_inputs = projected_latents[:, :16, :] # (1, 16, 2048)
         
         # Project through MCP
         conditioning_c = orchestrator.mcp(visual_inputs)
