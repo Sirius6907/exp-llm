@@ -560,5 +560,5 @@ class PixelleSiriusOrchestrator(nn.Module):
             outputs.append(out_target.cpu()) # Offload outputs to CPU host memory to keep VRAM strictly capped!
             
         print(f"[Phase 5] Long context prefill successfully completed. Final state initialized.")
-        return torch.cat(outputs, dim=1).to(self.device), draft_state, target_states
+        return torch.cat(outputs, dim=1), draft_state, target_states
 
