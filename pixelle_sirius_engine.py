@@ -305,7 +305,8 @@ class PixelleSiriusOrchestrator(nn.Module):
             config.rope_scaling = {
                 "type": "dynamic",
                 "rope_type": "dynamic",
-                "factor": 31.25 # Scale from 32,000 to 1,000,000 context
+                "factor": 31.25, # Scale from 32,000 to 1,000,000 context
+                "rope_theta": 1000000.0 # Explicitly preserve the base theta frequency
             }
             self.real_qwen = AutoModel.from_pretrained(qwen_id, config=config, torch_dtype=torch.float16)
             if offload:
