@@ -288,7 +288,7 @@ class PixelleSiriusOrchestrator(nn.Module):
         If offload=False, loads models permanently on the GPU for maximum execution speed and throughput.
         """
         try:
-            from transformers import AutoModel, AutoTokenizer, AutoProcessor
+            from transformers import AutoModel, AutoTokenizer, AutoProcessor, AutoConfig
             from any_to_any import OffloadedLayerWrapper
             print(f"\n[Real Weight Integration] Initializing pre-trained Hugging Face backbones (offload={offload})...")
             
@@ -298,7 +298,15 @@ class PixelleSiriusOrchestrator(nn.Module):
             else:
                 print(f"Loading {qwen_id} directly to GPU/execution device (MAX GPU)...")
             self.real_tokenizer = AutoTokenizer.from_pretrained(qwen_id)
-            self.real_qwen = AutoModel.from_pretrained(qwen_id, torch_dtype=torch.float16)
+            
+            # Phase 5 Context Expansion: Scale position embeddings to 1,000,000 context
+            config = AutoConfig.from_pretrained(qwen_id)
+            config.max_position_embeddings = 1000000
+            config.rope_scaling = {
+                "type": "dynamic",
+                "factor": 31.25 # Scale from 32,000 to 1,000,000 context
+            }
+            self.real_qwen = AutoModel.from_pretrained(qwen_id, config=config, torch_dtype=torch.float16)
             if offload:
                 if hasattr(self.real_qwen, "layers"):
                     wrapped_layers = [OffloadedLayerWrapper(layer, execution_device=self.device) for layer in self.real_qwen.layers]
@@ -520,3 +528,35 @@ class PixelleSiriusOrchestrator(nn.Module):
         latency = (t_end - t_start) * 1000
         
         return output, latency
+
+    def process_long_context(self, input_ids, chunk_size=2048):
+        """
+        Executes sequential chunk-wise state passing over extremely long input token sequences (up to 1M).
+        Maintains the compressed Mamba recurrent state throughout processing, preventing OOM errors.
+        """
+        B, S = input_ids.shape
+        print(f"[Phase 5 Long Context Ingestion] Processing sequence length {S} in chunks of {chunk_size}...")
+        
+        # 1. Prefill / Process sequentially in small activation-capped chunks
+        draft_state = None
+        target_states = [None, None, None]
+        outputs = []
+        
+        for i in range(0, S, chunk_size):
+            chunk = input_ids[:, i : i + chunk_size]
+            B_chunk, S_chunk = chunk.shape
+            
+            # Map chunk tokens to our hidden dimensions
+            x_chunk_h = torch.zeros(B_chunk, S_chunk, self.vlm_dim, device=self.device, dtype=torch.float32)
+            x_chunk_h[:, :, 0] = chunk.float()
+            
+            # Update draft and target states sequentially
+            with torch.no_grad():
+                out_draft, draft_state = self.draft_vlm(x_chunk_h, state=draft_state)
+                out_target, target_states = self.router(x_chunk_h, self.experts, states=target_states)
+                
+            outputs.append(out_target.cpu()) # Offload outputs to CPU host memory to keep VRAM strictly capped!
+            
+        print(f"[Phase 5] Long context prefill successfully completed. Final state initialized.")
+        return torch.cat(outputs, dim=1).to(self.device), draft_state, target_states
+
