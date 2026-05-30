@@ -300,6 +300,15 @@ class PixelleSiriusOrchestrator(nn.Module):
                 self.real_qwen.layers = nn.ModuleList(wrapped_layers)
                 print(f"Wrapped Qwen2 decoder blocks with dynamic offloader.")
                 
+                # Move lightweight normalization and embedding modules to the GPU permanently
+                if self.device.type != "cpu":
+                    if hasattr(self.real_qwen, "norm") and self.real_qwen.norm is not None:
+                        self.real_qwen.norm.to(self.device)
+                    if hasattr(self.real_qwen, "embed_tokens") and self.real_qwen.embed_tokens is not None:
+                        self.real_qwen.embed_tokens.to(self.device)
+                    if hasattr(self.real_qwen, "rotary_emb") and self.real_qwen.rotary_emb is not None:
+                        self.real_qwen.rotary_emb.to(self.device)
+                
             # Load and wrap SigLIP
             print(f"Loading {siglip_id} on CPU memory...")
             self.real_siglip_processor = AutoProcessor.from_pretrained(siglip_id)
@@ -309,6 +318,13 @@ class PixelleSiriusOrchestrator(nn.Module):
                 self.real_siglip.vision_model.encoder.layers = nn.ModuleList(wrapped_layers)
                 print(f"Wrapped SigLIP encoder blocks with dynamic offloader.")
                 
+                # Move non-offloaded modules of vision model to the GPU permanently
+                if self.device.type != "cpu":
+                    if hasattr(self.real_siglip.vision_model, "embeddings") and self.real_siglip.vision_model.embeddings is not None:
+                        self.real_siglip.vision_model.embeddings.to(self.device)
+                    if hasattr(self.real_siglip.vision_model, "post_layernorm") and self.real_siglip.vision_model.post_layernorm is not None:
+                        self.real_siglip.vision_model.post_layernorm.to(self.device)
+                
             # Load and wrap Whisper
             print(f"Loading {whisper_id} on CPU memory...")
             self.real_whisper_processor = AutoProcessor.from_pretrained(whisper_id)
@@ -317,6 +333,17 @@ class PixelleSiriusOrchestrator(nn.Module):
                 wrapped_layers = [OffloadedLayerWrapper(layer, execution_device=self.device) for layer in self.real_whisper.encoder.layers]
                 self.real_whisper.encoder.layers = nn.ModuleList(wrapped_layers)
                 print(f"Wrapped Whisper encoder blocks with dynamic offloader.")
+                
+                # Move non-offloaded modules of audio model to the GPU permanently
+                if self.device.type != "cpu":
+                    if hasattr(self.real_whisper.encoder, "conv1") and self.real_whisper.encoder.conv1 is not None:
+                        self.real_whisper.encoder.conv1.to(self.device)
+                    if hasattr(self.real_whisper.encoder, "conv2") and self.real_whisper.encoder.conv2 is not None:
+                        self.real_whisper.encoder.conv2.to(self.device)
+                    if hasattr(self.real_whisper.encoder, "embed_positions") and self.real_whisper.encoder.embed_positions is not None:
+                        self.real_whisper.encoder.embed_positions.to(self.device)
+                    if hasattr(self.real_whisper.encoder, "layer_norm") and self.real_whisper.encoder.layer_norm is not None:
+                        self.real_whisper.encoder.layer_norm.to(self.device)
                 
             self.real_weights_enabled = True
             print("[OK] Real weights loaded and integrated successfully.")

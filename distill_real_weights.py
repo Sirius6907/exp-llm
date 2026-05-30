@@ -69,6 +69,15 @@ def run_real_distillation_test():
             wrapped = [OffloadedLayerWrapper(layer, execution_device=device) for layer in layers_list]
             text_model.layers = nn.ModuleList(wrapped)
             print(f"  -> Wrapped {len(layers_list)} Qwen2 decoder layers in OffloadedLayerWrapper.")
+            
+            # Move lightweight normalization and embedding modules to the GPU permanently
+            if device != "cpu":
+                if hasattr(text_model, "norm") and text_model.norm is not None:
+                    text_model.norm.to(device)
+                if hasattr(text_model, "embed_tokens") and text_model.embed_tokens is not None:
+                    text_model.embed_tokens.to(device)
+                if hasattr(text_model, "rotary_emb") and text_model.rotary_emb is not None:
+                    text_model.rotary_emb.to(device)
         else:
             print("  -> WARNING: layers structure not standard. Skipping layer wrap.")
     except Exception as e:
@@ -91,6 +100,13 @@ def run_real_distillation_test():
             wrapped = [OffloadedLayerWrapper(layer, execution_device=device) for layer in layers_list]
             vision_model.vision_model.encoder.layers = nn.ModuleList(wrapped)
             print(f"  -> Wrapped {len(layers_list)} SigLIP vision encoder layers in OffloadedLayerWrapper.")
+            
+            # Move non-offloaded modules of vision model to the GPU permanently
+            if device != "cpu":
+                if hasattr(vision_model.vision_model, "embeddings") and vision_model.vision_model.embeddings is not None:
+                    vision_model.vision_model.embeddings.to(device)
+                if hasattr(vision_model.vision_model, "post_layernorm") and vision_model.vision_model.post_layernorm is not None:
+                    vision_model.vision_model.post_layernorm.to(device)
     except Exception as e:
         print(f"  -> ERROR loading SigLIP: {e}")
         vision_model = None
@@ -111,6 +127,17 @@ def run_real_distillation_test():
             wrapped = [OffloadedLayerWrapper(layer, execution_device=device) for layer in layers_list]
             audio_model.encoder.layers = nn.ModuleList(wrapped)
             print(f"  -> Wrapped {len(layers_list)} Whisper acoustic layers in OffloadedLayerWrapper.")
+            
+            # Move non-offloaded modules of audio model to the GPU permanently
+            if device != "cpu":
+                if hasattr(audio_model.encoder, "conv1") and audio_model.encoder.conv1 is not None:
+                    audio_model.encoder.conv1.to(device)
+                if hasattr(audio_model.encoder, "conv2") and audio_model.encoder.conv2 is not None:
+                    audio_model.encoder.conv2.to(device)
+                if hasattr(audio_model.encoder, "embed_positions") and audio_model.encoder.embed_positions is not None:
+                    audio_model.encoder.embed_positions.to(device)
+                if hasattr(audio_model.encoder, "layer_norm") and audio_model.encoder.layer_norm is not None:
+                    audio_model.encoder.layer_norm.to(device)
     except Exception as e:
         print(f"  -> ERROR loading Whisper: {e}")
         audio_model = None
@@ -133,7 +160,7 @@ def run_real_distillation_test():
         
         print("Executing offloaded Qwen2 forward pass...")
         with torch.no_grad():
-            out_hf = text_model(input_ids=input_ids.to("cpu"))
+            out_hf = text_model(input_ids=input_ids.to(device))
             text_features = out_hf.last_hidden_state
         print(f"  -> Text Latent Output Shape: {text_features.shape}")
 
@@ -147,7 +174,7 @@ def run_real_distillation_test():
         
         print("Executing offloaded SigLIP forward pass...")
         with torch.no_grad():
-            out_hf = vision_model.get_image_features(pixel_values=pixel_values.to("cpu"))
+            out_hf = vision_model.get_image_features(pixel_values=pixel_values.to(device))
             vision_features = out_hf
         print(f"  -> Vision Latent Output Shape: {vision_features.shape}")
 
@@ -162,7 +189,7 @@ def run_real_distillation_test():
         
         print("Executing offloaded Whisper forward pass...")
         with torch.no_grad():
-            out_hf = audio_model.encoder(input_features=input_features.to("cpu"))
+            out_hf = audio_model.encoder(input_features=input_features.to(device))
             audio_features = out_hf.last_hidden_state
         print(f"  -> Audio Latent Output Shape: {audio_features.shape}")
 
