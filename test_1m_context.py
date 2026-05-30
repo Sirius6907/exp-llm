@@ -31,7 +31,7 @@ def test_1m_context_window():
     
     # Ingest the real pre-trained backbones natively configured for 1M context
     print("\n[1/3] Loading pre-trained backbones natively configured for 1M context...")
-    orchestrator.load_real_backbones(offload=False)
+    orchestrator.load_real_backbones(offload=True)
     
     if not orchestrator.real_weights_enabled or orchestrator.real_qwen is None:
         print("❌ Could not initialize pre-trained backbones. Running in synthetic mode.")
