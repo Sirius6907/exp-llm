@@ -9,13 +9,13 @@ try:
 except ImportError:
     # Fallback definition if import path differs
     class TemporalWedgeBlock(nn.Module):
-        def __init__(self, dim=256, ssm_state_dim=16):
+        def __init__(self, dim=256, state_dim=16):
             super().__init__()
             self.dim = dim
-            self.state_dim = ssm_state_dim
-            self.A = nn.Parameter(-torch.exp(torch.zeros(dim, ssm_state_dim)))
-            self.B = nn.Parameter(torch.randn(dim, ssm_state_dim))
-            self.C = nn.Parameter(torch.randn(dim, ssm_state_dim))
+            self.state_dim = state_dim
+            self.A = nn.Parameter(-torch.exp(torch.zeros(dim, state_dim)))
+            self.B = nn.Parameter(torch.randn(dim, state_dim))
+            self.C = nn.Parameter(torch.randn(dim, state_dim))
             self.dt_proj = nn.Linear(dim, dim)
             
         def forward(self, x, h_prev=None):
@@ -52,7 +52,7 @@ def test_temporal_ssm_coherence():
     dim = 256
     num_frames = 16
     print(f"\nInitializing SSM Temporal Wedge (dim={dim}, frames={num_frames})...")
-    temporal_wedge = TemporalWedgeBlock(dim=dim, ssm_state_dim=16).to(device)
+    temporal_wedge = TemporalWedgeBlock(dim=dim, state_dim=16).to(device)
     temporal_wedge.eval()
     
     # ----------------------------------------------------
