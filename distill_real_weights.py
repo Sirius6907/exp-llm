@@ -173,7 +173,14 @@ def run_real_distillation_test():
         with torch.no_grad():
             out_hf = vision_model.get_image_features(pixel_values=pixel_values.to(device))
             vision_features = out_hf
-        print(f"  -> Vision Latent Output Shape: {vision_features.shape}")
+            
+        # SigLIP returns a tensor directly from get_image_features, let's extract its shape
+        if hasattr(vision_features, "shape"):
+            print(f"  -> Vision Latent Output Shape: {vision_features.shape}")
+        elif hasattr(vision_features, "pooler_output"):
+            print(f"  -> Vision Latent Output Shape: {vision_features.pooler_output.shape}")
+        else:
+            print("  -> Vision Latent successfully generated.")
 
     # Audio Step
     if audio_model is not None:
