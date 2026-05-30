@@ -23,8 +23,8 @@ def run_real_prediction_pipeline():
     orchestrator.eval()
     
     # 2. Ingest Pre-trained Backbones (Phase 4 Real Weights)
-    print("\nLoading pre-trained Qwen2, SigLIP, and Whisper backbones asynchronously...")
-    orchestrator.load_real_backbones()
+    print("\nLoading pre-trained Qwen2, SigLIP, and Whisper backbones directly to GPU (MAX GPU Mode)...")
+    orchestrator.load_real_backbones(offload=False)
     
     if not orchestrator.real_weights_enabled:
         print("❌ Could not initialize pre-trained backbones. Exiting.")
