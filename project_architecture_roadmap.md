@@ -130,3 +130,21 @@ We successfully integrated the engine offline to serve as the local desktop assi
   * Ingestion Latency: **30 - 40 ms** (SigLIP + Mamba SSM visual fuser).
   * Audio Processing Latency: **37.44 ms** (Whisper-Tiny features).
   * Peak GPU VRAM Reserved: **1786.74 MB** (comfortably under the 2.0 GB target limit!).
+
+---
+
+## Phase 9: Unified Pre-Train, Main Train, RL DPO Alignment, and Release Verification (Completed!)
+We finalized and executed the complete production training lifecycle, introducing full compatibility with high-performance cloud clusters (H100/H200) and strict edge validation:
+* **Distributed Pre-Training (`train_large_scale.py`):** Configured a production distributed data parallel (DDP) harness with automatic mixed precision (AMP) and cosine learning rate schedules for the multi-task generative orchestrator.
+* **SFT Adapter Fine-Tuning (`train_mcp_real.py`):** Fine-tuned the 1.58-bit Ternary MCP adapter weights, freezing the 2B backbone to achieve zero parameter-migration latency under a strict VRAM ceiling.
+* **Reinforcement Learning Alignment (`train_rl.py`):** Implemented a high-performance Direct Preference Optimization (DPO) and Policy Gradient RL loop. Optimizes policy outputs exclusively on the Ternary MCP adapter relative to a frozen reference model to ensure convergence under 3GB constraints.
+* **Edge Release Orchestration (`release.py`):** Built a unified testing harness running the complete pre-release validation suite (TokenFlow, SSM wedge, LCM solver, 4-bit edge inference, 1M context prefill, SFT tuning, and RL preference checks), automatically compiling an empirical operational readiness report (`RELEASE_REPORT.md`).
+
+---
+
+## Phase 10: Decentralized Modular Training & Expert Assembly (Completed!)
+We introduced a highly cost-effective, decentralized training strategy designed to bypass cloud subscription walls by partitioning training tasks across multiple free compute sessions (such as separate free Lightning.ai T4/L4 GPU accounts):
+* **Modular Expert Partitioning:** By leveraging the orchestrator's gated Sparse MoE architecture, users can train individual domain experts (Text Expert, Vision LCM Expert, Audio Whisper Expert, and Ternary MCP adapter) independently on separate free GPU nodes, eliminating the requirement for synchronized multi-node infrastructure.
+* **Federated Parameter Averaging (`federated_average.py`):** Implemented a mathematical parameter consolidation utility that performs Federated Averaging (FedAvg) over multiple state dictionaries, compiling separated weights cleanly back into a unified engine checkpoint (`pixelle_sirius_assembled.pth`) with zero loss of numerical stability.
+
+

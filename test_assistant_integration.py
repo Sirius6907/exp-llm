@@ -1,7 +1,8 @@
 import os
 import time
 import torch
-import numpy as np
+import dask.array as da
+import math
 from mark_xxxix_assistant import MarkXXXIXAssistantBrain
 
 def test_assistant_integration():
@@ -45,8 +46,9 @@ def test_assistant_integration():
     
     # 3. Ingest Voice command
     print("\n[2/4] Simulating voice command input (1-second mock mono audio)...")
-    # 1 second of 16000Hz mono audio
-    mock_audio = np.sin(np.linspace(0, 440 * 2 * np.pi, 16000)).astype(np.float32)
+    # 1 second of 16000Hz mono audio generated via Dask Array
+    da_t = da.linspace(0, 440 * 2 * math.pi, 16000, chunks=4000)
+    mock_audio = da.sin(da_t).astype(da.float32).compute()
     
     t_audio_start = time.time()
     audio_tokens = assistant.ingest_voice_command(mock_audio)
@@ -89,7 +91,7 @@ def test_assistant_integration():
     
     # 6. Execute Mock Loop Cycle
     def get_mock_audio():
-        return np.random.randn(16000).astype(np.float32)
+        return da.random.normal(size=16000, chunks=4000).astype(da.float32).compute()
         
     assistant.run_loop(num_iterations=2, interval=0.5, audio_mock_generator=get_mock_audio)
     

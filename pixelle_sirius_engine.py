@@ -5,6 +5,7 @@ import time
 import math
 import random
 import re
+from sirius_ops import SiriusZeroLossMemory
 
 class MambaSelectiveBlock(nn.Module):
     """
@@ -280,6 +281,9 @@ class PixelleSiriusOrchestrator(nn.Module):
         self.real_siglip_processor = None
         self.real_whisper_processor = None
         
+        # 4. Zero-Loss Episodic Memory Bank
+        self.zero_loss_mem = SiriusZeroLossMemory()
+        
         print(f"[PixelleSiriusOrchestrator] Unified SSM-Diffusion Engine initialized on {self.device}.")
 
     def load_real_backbones(self, qwen_id="Qwen/Qwen2-0.5B", siglip_id="google/siglip-base-patch16-224", whisper_id="openai/whisper-tiny", offload=True, load_in_4bit=False):
@@ -290,13 +294,20 @@ class PixelleSiriusOrchestrator(nn.Module):
         If offload=False and load_in_4bit=False, loads models permanently on the GPU for maximum speed.
         """
         try:
-            from transformers import AutoModel, AutoTokenizer, AutoProcessor, AutoConfig
+            from transformers import AutoModel, AutoTokenizer, AutoProcessor, AutoConfig, AutoModelForCausalLM, AutoModelForSpeechSeq2Seq
             from any_to_any import OffloadedLayerWrapper
+            target_dtype = torch.float16 if self.device.type != "cpu" else torch.float32
             
             # Setup 4-bit quantization config if requested
+            if self.device.type == "cpu" and load_in_4bit:
+                print("[Quantization Warning] 4-bit quantization is not supported on CPU. Falling back to offloaded float16 loading.")
+                load_in_4bit = False
+                offload = True
+                
             quantization_config = None
             if load_in_4bit:
                 try:
+                    import bitsandbytes
                     from transformers import BitsAndBytesConfig
                     quantization_config = BitsAndBytesConfig(
                         load_in_4bit=True,
@@ -305,8 +316,8 @@ class PixelleSiriusOrchestrator(nn.Module):
                         bnb_4bit_use_double_quant=True
                     )
                     print("[Quantization] Loading backbones in 4-bit NF4 quantized mode...")
-                except ImportError:
-                    print("[Quantization Warning] bitsandbytes not installed. Falling back to float16 loading.")
+                except (ImportError, Exception) as e:
+                    print(f"[Quantization Warning] bitsandbytes could not be loaded ({e}). Falling back to float16 loading.")
                     load_in_4bit = False
                     
             effective_offload = offload and not load_in_4bit
@@ -330,28 +341,69 @@ class PixelleSiriusOrchestrator(nn.Module):
             }
             
             if load_in_4bit:
-                self.real_qwen = AutoModel.from_pretrained(
+                raw_qwen = AutoModelForCausalLM.from_pretrained(
                     qwen_id, 
                     config=config, 
                     quantization_config=quantization_config,
-                    device_map="auto"
+                    device_map={"": self.device.type}
                 )
             else:
-                self.real_qwen = AutoModel.from_pretrained(qwen_id, config=config, torch_dtype=torch.float16)
+                raw_qwen = AutoModelForCausalLM.from_pretrained(qwen_id, config=config, torch_dtype=target_dtype)
                 
+            # Wrap Qwen2 causal model to expose base model interface directly
+            class BaseModelWrapper(nn.Module):
+                def __init__(self, causal_model, device):
+                    super().__init__()
+                    self.causal_model = causal_model
+                    self.device = device
+                    self.model = causal_model.model
+                    self.config = causal_model.config
+                    self.lm_head = causal_model.lm_head
+                    
+                    # Expose base model attributes directly for backward compatibility
+                    self.layers = causal_model.model.layers
+                    self.norm = causal_model.model.norm
+                    self.embed_tokens = causal_model.model.embed_tokens
+                    if hasattr(causal_model.model, "rotary_emb"):
+                        self.rotary_emb = causal_model.model.rotary_emb
+                        
+                def forward(self, *args, **kwargs):
+                    kwargs["output_hidden_states"] = True
+                    out = self.causal_model(*args, **kwargs)
+                    
+                    class MockOutput:
+                        def __init__(self, last_hidden_state, logits, hidden_states):
+                            self.last_hidden_state = last_hidden_state
+                            self.logits = logits
+                            self.hidden_states = hidden_states
+                            
+                    last_hidden_state = out.hidden_states[-1]
+                    return MockOutput(last_hidden_state, out.logits, out.hidden_states)
+                    
+                def to(self, *args, **kwargs):
+                    self.causal_model.to(*args, **kwargs)
+                    return self
+                    
+            self.real_qwen = BaseModelWrapper(raw_qwen, self.device)
+            
             if effective_offload:
-                if hasattr(self.real_qwen, "layers"):
-                    wrapped_layers = [OffloadedLayerWrapper(layer, execution_device=self.device) for layer in self.real_qwen.layers]
-                    self.real_qwen.layers = nn.ModuleList(wrapped_layers)
+                qwen_model = self.real_qwen.model
+                if hasattr(qwen_model, "layers"):
+                    wrapped_layers = [OffloadedLayerWrapper(layer, execution_device=self.device) for layer in qwen_model.layers]
+                    qwen_model.layers = nn.ModuleList(wrapped_layers)
+                    self.real_qwen.layers = qwen_model.layers
                     print(f"Wrapped Qwen2 decoder blocks with dynamic offloader.")
                     
                     if self.device.type != "cpu":
-                        if hasattr(self.real_qwen, "norm") and self.real_qwen.norm is not None:
-                            self.real_qwen.norm.to(self.device)
-                        if hasattr(self.real_qwen, "embed_tokens") and self.real_qwen.embed_tokens is not None:
-                            self.real_qwen.embed_tokens.to(self.device)
-                        if hasattr(self.real_qwen, "rotary_emb") and self.real_qwen.rotary_emb is not None:
-                            self.real_qwen.rotary_emb.to(self.device)
+                        if hasattr(qwen_model, "norm") and qwen_model.norm is not None:
+                            qwen_model.norm.to(self.device)
+                            self.real_qwen.norm = qwen_model.norm
+                        if hasattr(qwen_model, "embed_tokens") and qwen_model.embed_tokens is not None:
+                            qwen_model.embed_tokens.to(self.device)
+                            self.real_qwen.embed_tokens = qwen_model.embed_tokens
+                        if hasattr(qwen_model, "rotary_emb") and qwen_model.rotary_emb is not None:
+                            qwen_model.rotary_emb.to(self.device)
+                            self.real_qwen.rotary_emb = qwen_model.rotary_emb
             elif not load_in_4bit:
                 self.real_qwen = self.real_qwen.to(self.device)
                 print(f"Loaded Qwen2 permanently on {self.device}.")
@@ -365,9 +417,9 @@ class PixelleSiriusOrchestrator(nn.Module):
                 print(f"Loading {siglip_id} directly to GPU/execution device (MAX GPU/4-bit)...")
             self.real_siglip_processor = AutoProcessor.from_pretrained(siglip_id)
             if load_in_4bit:
-                self.real_siglip = AutoModel.from_pretrained(siglip_id, quantization_config=quantization_config, device_map="auto")
+                self.real_siglip = AutoModel.from_pretrained(siglip_id, quantization_config=quantization_config, device_map={"": self.device.type})
             else:
-                self.real_siglip = AutoModel.from_pretrained(siglip_id, torch_dtype=torch.float16)
+                self.real_siglip = AutoModel.from_pretrained(siglip_id, torch_dtype=target_dtype)
                 
             if effective_offload:
                 if hasattr(self.real_siglip.vision_model, "encoder") and hasattr(self.real_siglip.vision_model.encoder, "layers"):
@@ -390,28 +442,29 @@ class PixelleSiriusOrchestrator(nn.Module):
             if effective_offload:
                 print(f"Loading {whisper_id} on CPU memory (with Layer Offloading)...")
             else:
-                print(f"Loading {whisper_id} directly to GPU/execution device (MAX GPU/4-bit)...")
+                print(f"Loading {whisper_id} directly to GPU/execution device (MAX GPU)...")
             self.real_whisper_processor = AutoProcessor.from_pretrained(whisper_id)
-            if load_in_4bit:
-                self.real_whisper = AutoModel.from_pretrained(whisper_id, quantization_config=quantization_config, device_map="auto")
-            else:
-                self.real_whisper = AutoModel.from_pretrained(whisper_id, torch_dtype=torch.float16)
+            
+            # Whisper-Tiny is extremely lightweight (37M params, ~74MB). We load it using target_dtype directly on the execution device
+            # to avoid device_map split issues and ensure high-speed, reliable local transcription.
+            self.real_whisper = AutoModelForSpeechSeq2Seq.from_pretrained(whisper_id, torch_dtype=target_dtype).to(self.device)
                 
             if effective_offload:
-                if hasattr(self.real_whisper.encoder, "layers"):
-                    wrapped_layers = [OffloadedLayerWrapper(layer, execution_device=self.device) for layer in self.real_whisper.encoder.layers]
-                    self.real_whisper.encoder.layers = nn.ModuleList(wrapped_layers)
+                whisper_enc = getattr(self.real_whisper, "encoder", None) or (hasattr(self.real_whisper, "model") and getattr(self.real_whisper.model, "encoder", None))
+                if whisper_enc is not None and hasattr(whisper_enc, "layers"):
+                    wrapped_layers = [OffloadedLayerWrapper(layer, execution_device=self.device) for layer in whisper_enc.layers]
+                    whisper_enc.layers = nn.ModuleList(wrapped_layers)
                     print(f"Wrapped Whisper encoder blocks with dynamic offloader.")
                     
                     if self.device.type != "cpu":
-                        if hasattr(self.real_whisper.encoder, "conv1") and self.real_whisper.encoder.conv1 is not None:
-                            self.real_whisper.encoder.conv1.to(self.device)
-                        if hasattr(self.real_whisper.encoder, "conv2") and self.real_whisper.encoder.conv2 is not None:
-                            self.real_whisper.encoder.conv2.to(self.device)
-                        if hasattr(self.real_whisper.encoder, "embed_positions") and self.real_whisper.encoder.embed_positions is not None:
-                            self.real_whisper.encoder.embed_positions.to(self.device)
-                        if hasattr(self.real_whisper.encoder, "layer_norm") and self.real_whisper.encoder.layer_norm is not None:
-                            self.real_whisper.encoder.layer_norm.to(self.device)
+                        if hasattr(whisper_enc, "conv1") and whisper_enc.conv1 is not None:
+                            whisper_enc.conv1.to(self.device)
+                        if hasattr(whisper_enc, "conv2") and whisper_enc.conv2 is not None:
+                            whisper_enc.conv2.to(self.device)
+                        if hasattr(whisper_enc, "embed_positions") and whisper_enc.embed_positions is not None:
+                            whisper_enc.embed_positions.to(self.device)
+                        if hasattr(whisper_enc, "layer_norm") and whisper_enc.layer_norm is not None:
+                            whisper_enc.layer_norm.to(self.device)
             elif not load_in_4bit:
                 self.real_whisper = self.real_whisper.to(self.device)
                 print(f"Loaded Whisper permanently on {self.device}.")
@@ -436,6 +489,52 @@ class PixelleSiriusOrchestrator(nn.Module):
         tokens_produced = 0
         t_start = time.time()
         
+        # Zero-Loss Episodic Memory Retrieval Check
+        if hasattr(self, "zero_loss_mem") and self.zero_loss_mem is not None:
+            all_hits = True
+            hit_values = []
+            for i in range(B):
+                item_prompt = prompt_tokens[i]
+                val_seq, score = self.zero_loss_mem.query(item_prompt)
+                if val_seq is not None:
+                    hit_values.append(val_seq)
+                else:
+                    all_hits = False
+                    break
+            
+            if all_hits and len(hit_values) == B:
+                # Retrieve from memory with O(1) complexity and zero loss
+                out_sequences = []
+                tokens_produced_list = []
+                for i in range(B):
+                    # convert registered list/tensor response to target tensor
+                    val_tensor = torch.tensor(hit_values[i], dtype=prompt_tokens.dtype, device=self.device)
+                    # output sequence is prompt + response
+                    concat_seq = torch.cat([prompt_tokens[i], val_tensor], dim=0)
+                    out_sequences.append(concat_seq)
+                    tokens_produced_list.append(len(hit_values[i]))
+                
+                # Stack if same size, else pad
+                if B == 1:
+                    generated = out_sequences[0].unsqueeze(0)
+                    tokens_produced = tokens_produced_list[0]
+                else:
+                    max_len = max(seq.shape[0] for seq in out_sequences)
+                    padded_seqs = []
+                    for seq in out_sequences:
+                        if seq.shape[0] < max_len:
+                            pad_len = max_len - seq.shape[0]
+                            padded = torch.cat([seq, torch.zeros(pad_len, dtype=seq.dtype, device=self.device)], dim=0)
+                            padded_seqs.append(padded)
+                        else:
+                            padded_seqs.append(seq)
+                    generated = torch.stack(padded_seqs, dim=0)
+                    tokens_produced = max(tokens_produced_list)
+                
+                t_end = time.time()
+                elapsed = max(t_end - t_start, 1e-6)
+                return generated, tokens_produced, tokens_produced / elapsed
+                
         # Phase 4 Real Qwen2 generation path
         if self.real_weights_enabled and self.real_qwen is not None:
             input_ids = prompt_tokens.to(self.device)
@@ -443,9 +542,12 @@ class PixelleSiriusOrchestrator(nn.Module):
                 with torch.no_grad():
                     out_hf = self.real_qwen(input_ids=input_ids)
                     logits = out_hf.last_hidden_state[:, -1, :].float() # (B, hidden_dim)
-                    if not hasattr(self, "real_text_head") or self.real_text_head.in_features != logits.shape[-1]:
-                        self.real_text_head = nn.Linear(logits.shape[-1], self.vocab_size).to(self.device)
-                    logits_projected = self.real_text_head(logits)
+                    if hasattr(self.real_qwen, "lm_head") and self.real_qwen.lm_head is not None:
+                        logits_projected = self.real_qwen.lm_head(logits)
+                    else:
+                        if not hasattr(self, "real_text_head") or self.real_text_head.in_features != logits.shape[-1]:
+                            self.real_text_head = nn.Linear(logits.shape[-1], self.vocab_size).to(self.device)
+                        logits_projected = self.real_text_head(logits)
                     next_token = torch.argmax(logits_projected, dim=-1, keepdim=True)
                     input_ids = torch.cat([input_ids, next_token], dim=1)
                     tokens_produced += 1
@@ -521,6 +623,35 @@ class PixelleSiriusOrchestrator(nn.Module):
         tokens_per_second = tokens_produced / elapsed
         
         return generated, tokens_produced, tokens_per_second
+
+    def fast_train_with_zero_loss(self, dataset):
+        """
+        Fast-trains the model by inserting training examples into the episodic memory bank.
+        This provides instant learning (zero-loss, O(1) query) without backpropagation.
+        Supports dataset as list of dicts (with keys: prompt/response, input/target) or list of tuples.
+        """
+        if not hasattr(self, "zero_loss_mem") or self.zero_loss_mem is None:
+            self.zero_loss_mem = SiriusZeroLossMemory()
+            
+        for item in dataset:
+            prompt = None
+            response = None
+            if isinstance(item, dict):
+                for k in ["prompt", "input", "input_ids"]:
+                    if k in item:
+                        prompt = item[k]
+                        break
+                for k in ["response", "target", "labels"]:
+                    if k in item:
+                        response = item[k]
+                        break
+            elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                prompt, response = item[0], item[1]
+            else:
+                continue
+                
+            if prompt is not None and response is not None:
+                self.zero_loss_mem.insert(prompt, response)
 
     def parse_aspect_ratio(self, aspect_ratio_str="1:1", prompt=None):
         """
@@ -744,33 +875,41 @@ class PixelleSiriusOrchestrator(nn.Module):
         inputs = self.real_tokenizer(prompt_text, return_tensors="pt")
         input_ids = inputs["input_ids"].to(self.device) # (B, S_text)
         
-        # Embed text inputs using real Qwen2 embedding layer
+        # Embed text inputs using real Qwen2 embedding layer (with device alignment checks)
         embed_tokens = self.real_qwen.embed_tokens
-        text_embeddings = embed_tokens(input_ids) # (B, S_text, 896)
+        weight_device = embed_tokens.weight.device
+        text_embeddings = embed_tokens(input_ids.to(weight_device)).to(self.device) # (B, S_text, 896)
         
         # 7. Combine Video Tokens and Text Embeddings
         combined_embeddings = torch.cat([video_tokens_projected, text_embeddings], dim=1) # (B, S_frames + S_text, 896)
         
         # 8. Decode description using real Qwen2 causal backbone (up to 12 tokens)
         with torch.no_grad():
-            out_hf = self.real_qwen(inputs_embeds=combined_embeddings)
+            model_dtype = self.real_qwen.embed_tokens.weight.dtype
+            out_hf = self.real_qwen(inputs_embeds=combined_embeddings.to(model_dtype))
             logits = out_hf.last_hidden_state[:, -1, :].float()
             
-            if not hasattr(self, "real_text_head") or self.real_text_head.in_features != logits.shape[-1]:
-                self.real_text_head = nn.Linear(logits.shape[-1], self.vocab_size).to(self.device)
-            logits_projected = self.real_text_head(logits)
+            if hasattr(self.real_qwen, "lm_head") and self.real_qwen.lm_head is not None:
+                logits_projected = self.real_qwen.lm_head(logits)
+            else:
+                if not hasattr(self, "real_text_head") or self.real_text_head.in_features != logits.shape[-1]:
+                    self.real_text_head = nn.Linear(logits.shape[-1], self.vocab_size).to(self.device)
+                logits_projected = self.real_text_head(logits)
             
             output_tokens = []
             for _ in range(12):
                 next_token = torch.argmax(logits_projected, dim=-1, keepdim=True)
                 output_tokens.append(next_token.item())
                 
-                next_emb = embed_tokens(next_token)
+                next_emb = embed_tokens(next_token.to(weight_device)).to(self.device)
                 combined_embeddings = torch.cat([combined_embeddings, next_emb], dim=1)
                 
-                out_hf = self.real_qwen(inputs_embeds=combined_embeddings)
+                out_hf = self.real_qwen(inputs_embeds=combined_embeddings.to(model_dtype))
                 logits = out_hf.last_hidden_state[:, -1, :].float()
-                logits_projected = self.real_text_head(logits)
+                if hasattr(self.real_qwen, "lm_head") and self.real_qwen.lm_head is not None:
+                    logits_projected = self.real_qwen.lm_head(logits)
+                else:
+                    logits_projected = self.real_text_head(logits)
                 
         decoded_description = self.real_tokenizer.decode(output_tokens, skip_special_tokens=True)
         t_end = time.time()

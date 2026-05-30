@@ -89,14 +89,22 @@ def train_real_mcp_adapter():
     ).to(device)
     mcp_projector.train()
     
-    # 4. Setup Dataloader, Optimizer and AMP GradScaler
-    dataset = RealTextPromptDataset()
+    # 4. Setup Train and Validation Dataloaders (80% / 20% split)
+    full_dataset = RealTextPromptDataset()
     # Multiply prompts to simulate a larger dataset for high-throughput pipeline testing
-    dataset.prompts = dataset.prompts * 32  # 16 * 32 = 512 samples
+    full_dataset.prompts = full_dataset.prompts * 32  # 512 samples
     
-    # Maximize CPU and RAM utilization by using multiple workers and memory pinning
-    dataloader = DataLoader(
-        dataset, 
+    split_idx = int(len(full_dataset.prompts) * 0.8)
+    
+    train_dataset = RealTextPromptDataset()
+    train_dataset.prompts = full_dataset.prompts[:split_idx]
+    
+    val_dataset = RealTextPromptDataset()
+    val_dataset.prompts = full_dataset.prompts[split_idx:]
+    
+    # Maximize CPU and RAM utilization with pin_memory
+    train_dataloader = DataLoader(
+        train_dataset, 
         batch_size=16, 
         shuffle=True, 
         num_workers=4, 
@@ -104,16 +112,22 @@ def train_real_mcp_adapter():
         persistent_workers=True
     )
     
+    val_dataloader = DataLoader(
+        val_dataset,
+        batch_size=16,
+        shuffle=False,
+        num_workers=2,
+        pin_memory=True,
+        persistent_workers=True
+    )
+    
     # Only optimize MCP parameters
     optimizer = optim.AdamW(mcp_projector.parameters(), lr=2e-4, weight_decay=1e-2)
     scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
     
-    # 5. Teacher Model Target Simulator
-    # Fuses visual-semantic text alignment targets (representing ideal T5/CLIP features)
-    def simulate_teacher_targets(B, S, device):
-        # Downsampled sequence length = S // 2
-        return torch.randn(B, S // 2, dit_dim, device=device)
-        
+    best_val_loss = float('inf')
+    save_path = "mcp_alignment_real.pth"
+    
     print("\n==================================================")
     print("           Starting Adapter Tuning Loop           ")
     print("==================================================")
@@ -125,7 +139,8 @@ def train_real_mcp_adapter():
         epoch_loss = 0.0
         step_times = []
         
-        for batch_idx, prompts in enumerate(dataloader):
+        mcp_projector.train()
+        for batch_idx, prompts in enumerate(train_dataloader):
             t0 = time.time()
             optimizer.zero_grad()
             
@@ -145,8 +160,10 @@ def train_real_mcp_adapter():
                 # 2. Forward pass through Ternary MCP (Gradients pass through custom STE)
                 projected_c = mcp_projector(hidden_states)
                 
-                # 3. Simulate target teacher embeddings to match projected_c shape exactly
-                target_c = torch.randn_like(projected_c)
+                # 3. Simulate deterministic target teacher embeddings to make losses stable and comparable
+                generator = torch.Generator(device=device)
+                generator.manual_seed(int(input_ids.sum().item()) % 999983)
+                target_c = torch.randn(projected_c.shape, device=device, generator=generator)
                 
                 # 4. Compute alignment loss (MSE)
                 loss = F.mse_loss(projected_c, target_c)
@@ -165,23 +182,49 @@ def train_real_mcp_adapter():
             step_times.append((t1 - t0) * 1000)
             epoch_loss += loss.item()
             
-            print(f"Epoch {epoch+1:02d} | Batch {batch_idx+1}/{len(dataloader)} | Loss: {loss.item():.4f} | Latency: {step_times[-1]:.2f} ms")
+            print(f"Epoch {epoch+1:02d} | Batch {batch_idx+1}/{len(train_dataloader)} | Loss: {loss.item():.4f} | Latency: {step_times[-1]:.2f} ms")
             
-        avg_loss = epoch_loss / len(dataloader)
+        avg_loss = epoch_loss / len(train_dataloader)
         avg_step = sum(step_times) / len(step_times)
-        print(f"--------------------------------------------------")
-        print(f"Epoch {epoch+1:02d} Summary | Average Loss: {avg_loss:.4f} | Avg Step Time: {avg_step:.2f} ms")
-        print(f"--------------------------------------------------\n")
         
+        # 6. Evaluation Phase (Validation Set / Dev Loss)
+        mcp_projector.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for val_prompts in val_dataloader:
+                inputs = orchestrator.real_tokenizer(val_prompts, padding=True, return_tensors="pt")
+                input_ids = inputs["input_ids"].to(device)
+                
+                with torch.cuda.amp.autocast(enabled=(device.type == "cuda"), dtype=torch.float16):
+                    out_hf = orchestrator.real_qwen(input_ids=input_ids, output_hidden_states=True)
+                    hidden_states = [h.float() for h in out_hf.hidden_states[-num_layers:]]
+                    projected_c = mcp_projector(hidden_states)
+                    
+                    generator = torch.Generator(device=device)
+                    generator.manual_seed(int(input_ids.sum().item()) % 999983)
+                    target_c = torch.randn(projected_c.shape, device=device, generator=generator)
+                    
+                    loss = F.mse_loss(projected_c, target_c)
+                    val_loss += loss.item()
+                    
+        avg_val_loss = val_loss / len(val_dataloader)
+        
+        print(f"--------------------------------------------------")
+        print(f"Epoch {epoch+1:02d} Summary | Train Loss: {avg_loss:.4f} | Val (Dev) Loss: {avg_val_loss:.4f} | Avg Step Time: {avg_step:.2f} ms")
+        print(f"--------------------------------------------------")
+        
+        # Save only the checkpoint with the lowest validation loss (peak intelligence sweet spot)
+        if avg_val_loss < best_val_loss:
+            print(f"  -> [New Best] Validation Loss improved from {best_val_loss:.4f} to {avg_val_loss:.4f}. Saving checkpoint to {save_path}...\n")
+            best_val_loss = avg_val_loss
+            torch.save(mcp_projector.state_dict(), save_path)
+        else:
+            print(f"  -> [Warning] Validation Loss did not improve (Current: {avg_val_loss:.4f}, Best: {best_val_loss:.4f}). Preserving peak intelligence checkpoint.\n")
+            
     t_end = time.time()
     print("==================================================")
     print(f"Adapter Pre-training Completed in {t_end - t_start:.2f} seconds.")
-    
-    # Save the trained adapter checkpoint
-    save_path = "mcp_alignment_real.pth"
-    print(f"Saving trained Ternary MCP weights to: {save_path}")
-    torch.save(mcp_projector.state_dict(), save_path)
-    print("Tuned Adapter saved successfully!")
+    print(f"Peak intelligence model preserved with validation loss: {best_val_loss:.4f}")
     print("==================================================")
 
 if __name__ == "__main__":

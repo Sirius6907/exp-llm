@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
+import dask.array as da
 
 # Import our temporal wedge block and SigLIP dependencies
 try:
@@ -92,31 +92,37 @@ def test_temporal_ssm_coherence():
     print("      Empirical Coherence Evaluation Metrics      ")
     print("==================================================")
     
-    # Flat features for similarity comparison: (num_frames, B * L * D)
-    flat_inputs = [f.view(-1).cpu().numpy() for f in frames_features]
-    flat_outputs = [o.view(-1).cpu().numpy() for o in ssm_outputs]
+    # Flat features for similarity comparison: (num_frames, B * L * D) using Dask array
+    flat_inputs = [da.from_array(f.view(-1).cpu().numpy(), chunks=1000) for f in frames_features]
+    flat_outputs = [da.from_array(o.view(-1).cpu().numpy(), chunks=1000) for o in ssm_outputs]
     
     input_similarities = []
     output_similarities = []
     
     for i in range(num_frames - 1):
-        # Calculate cosine similarity between frame i and frame i+1
-        in_sim = np.dot(flat_inputs[i], flat_inputs[i+1]) / (np.linalg.norm(flat_inputs[i]) * np.linalg.norm(flat_inputs[i+1]))
-        out_sim = np.dot(flat_outputs[i], flat_outputs[i+1]) / (np.linalg.norm(flat_outputs[i]) * np.linalg.norm(flat_outputs[i+1]))
+        # Calculate cosine similarity between frame i and frame i+1 using Dask
+        in_sim = da.dot(flat_inputs[i], flat_inputs[i+1]) / (da.linalg.norm(flat_inputs[i]) * da.linalg.norm(flat_inputs[i+1]))
+        out_sim = da.dot(flat_outputs[i], flat_outputs[i+1]) / (da.linalg.norm(flat_outputs[i]) * da.linalg.norm(flat_outputs[i+1]))
         
         input_similarities.append(in_sim)
         output_similarities.append(out_sim)
         
-        print(f"Frame {i+1:02d} -> {i+2:02d} | Input Sim: {in_sim:.5f} | SSM Output Sim: {out_sim:.5f}")
+        in_sim_val, out_sim_val = da.compute(in_sim, out_sim)
+        print(f"Frame {i+1:02d} -> {i+2:02d} | Input Sim: {in_sim_val:.5f} | SSM Output Sim: {out_sim_val:.5f}")
         
-    avg_in_sim = np.mean(input_similarities)
-    avg_out_sim = np.mean(output_similarities)
-    variance_drift = np.var(output_similarities)
+    da_input_similarities = da.stack(input_similarities)
+    da_output_similarities = da.stack(output_similarities)
+    
+    avg_in_sim = da.mean(da_input_similarities)
+    avg_out_sim = da.mean(da_output_similarities)
+    variance_drift = da.var(da_output_similarities)
+    
+    avg_in_sim_val, avg_out_sim_val, variance_drift_val = da.compute(avg_in_sim, avg_out_sim, variance_drift)
     
     print("-" * 50)
-    print(f"Average Input Similarity (Ground Truth):  {avg_in_sim:.5f}")
-    print(f"Average SSM Output Similarity (Coherence): {avg_out_sim:.5f}")
-    print(f"SSM Recurrent Similarity Variance:         {variance_drift:.7f}")
+    print(f"Average Input Similarity (Ground Truth):  {avg_in_sim_val:.5f}")
+    print(f"Average SSM Output Similarity (Coherence): {avg_out_sim_val:.5f}")
+    print(f"SSM Recurrent Similarity Variance:         {variance_drift_val:.7f}")
     
     # Check for representation collapse or signal decay
     # Identity preservation holds if cosine similarity remains high (> 0.95) and stable

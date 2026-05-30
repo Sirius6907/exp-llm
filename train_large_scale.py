@@ -5,6 +5,7 @@ import math
 import random
 import time
 import numpy as np
+import dask.array as da
 from PIL import Image
 
 import torch
@@ -69,7 +70,8 @@ class LargeScaleMultimodalDataset(Dataset):
             try:
                 path = self.image_files[idx % len(self.image_files)]
                 img = Image.open(path).convert('RGB').resize((64, 64))
-                return torch.from_numpy(np.array(img)).float().permute(2, 0, 1) / 255.0
+                da_img = da.from_array(np.array(img), chunks=(32, 32, 3))
+                return torch.from_numpy(da_img.compute()).float().permute(2, 0, 1) / 255.0
             except Exception:
                 pass
         return torch.randn(3, 64, 64)
@@ -83,14 +85,15 @@ class LargeScaleMultimodalDataset(Dataset):
                 path = self.audio_files[idx % len(self.audio_files)]
                 from scipy.io import wavfile
                 sample_rate, data = wavfile.read(path)
-                if len(data.shape) > 1:
-                    data = data[:, 0]
-                data = data.astype(np.float32) / 32768.0
-                if len(data) < 16000:
-                    data = np.pad(data, (0, 16000 - len(data)))
+                da_data = da.from_array(data, chunks=(8000,))
+                if len(da_data.shape) > 1:
+                    da_data = da_data[:, 0]
+                da_data = da_data.astype(np.float32) / 32768.0
+                if len(da_data) < 16000:
+                    da_data = da.pad(da_data, (0, 16000 - len(da_data)), mode='constant')
                 else:
-                    data = data[:16000]
-                return torch.from_numpy(data).unsqueeze(0)
+                    da_data = da_data[:16000]
+                return torch.from_numpy(da_data.compute()).unsqueeze(0)
             except Exception:
                 pass
         return torch.randn(1, 16000)

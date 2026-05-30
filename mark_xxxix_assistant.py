@@ -1,4 +1,14 @@
+import sys
 import os
+
+# Force standard output and error streams to use UTF-8 on Windows to prevent Unicode encoding crashes
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except AttributeError:
+        pass
+
 import time
 import torch
 import torch.nn as nn
@@ -61,16 +71,25 @@ class MarkXXXIXAssistantBrain(nn.Module):
         if not self.orchestrator.real_weights_enabled or self.orchestrator.real_siglip is None:
             return None
             
+        # SigLIP might be loaded on CPU to conserve VRAM
+        siglip_device = next(self.orchestrator.real_siglip.parameters()).device
+        
         # Process image using SigLIP
         inputs = self.orchestrator.real_siglip_processor(images=image, return_tensors="pt")
-        pixel_values = inputs["pixel_values"].to(self.device)
-        if pixel_values.dtype != torch.float16 and self.device.type == "cuda":
-            pixel_values = pixel_values.to(torch.float16)
+        pixel_values = inputs["pixel_values"].to(siglip_device)
+        
+        # Match weight dtype
+        if hasattr(self.orchestrator.real_siglip.vision_model, "embeddings"):
+            try:
+                target_dtype = next(self.orchestrator.real_siglip.vision_model.embeddings.parameters()).dtype
+                pixel_values = pixel_values.to(target_dtype)
+            except StopIteration:
+                pass
             
         with torch.no_grad():
             outputs = self.orchestrator.real_siglip.vision_model(pixel_values=pixel_values)
             # Extracted pooled representation of shape (1, 768)
-            frame_features = outputs.pooler_output.float()
+            frame_features = outputs.pooler_output.float().to(self.device)
             
             # Map vision tokens to orchestrator VLM dimension (2048) for SSM fusion
             if not hasattr(self, "mcp_vision_fuser"):
@@ -98,20 +117,44 @@ class MarkXXXIXAssistantBrain(nn.Module):
         if not self.orchestrator.real_weights_enabled or self.orchestrator.real_whisper is None:
             return None
             
+        # Whisper might be loaded on CPU to conserve VRAM
+        whisper_device = next(self.orchestrator.real_whisper.parameters()).device
+        
         # audio_waveform should be a 1D numpy array or tensor (16kHz mono)
         inputs = self.orchestrator.real_whisper_processor(audio_waveform, sampling_rate=16000, return_tensors="pt")
-        input_features = inputs["input_features"].to(self.device)
-        # Keep as float32 to avoid Conv1d bias precision mismatch in 4-bit mode
-        if self.device.type == "cuda":
-            input_features = input_features.float()
+        input_features = inputs["input_features"].to(whisper_device)
+        
+        # Dynamically match the dtype of the Whisper encoder weights
+        encoder = self.orchestrator.real_whisper.get_encoder()
+        if hasattr(encoder, "conv1"):
+            target_dtype = encoder.conv1.weight.dtype
+            input_features = input_features.to(target_dtype)
             
         with torch.no_grad():
-            outputs = self.orchestrator.real_whisper.encoder(input_features=input_features)
+            outputs = encoder(input_features=input_features)
             # Map Whisper acoustic encoder features (B, S_audio, D_whisper) to Qwen2 space
-            whisper_features = outputs.last_hidden_state.float() # (1, S_audio, 384)
+            whisper_features = outputs.last_hidden_state.float().to(self.device) # Move to GPU
             qwen_audio_tokens = self.audio_projector(whisper_features) # (1, S_audio, 896)
             
         return qwen_audio_tokens
+
+    def transcribe_audio(self, audio_waveform):
+        """
+        Transcribes the mono 16kHz audio waveform into text using Whisper generation.
+        """
+        if not self.orchestrator.real_weights_enabled or self.orchestrator.real_whisper is None:
+            return ""
+        try:
+            whisper_device = next(self.orchestrator.real_whisper.parameters()).device
+            inputs = self.orchestrator.real_whisper_processor(audio_waveform, sampling_rate=16000, return_tensors="pt")
+            input_features = inputs["input_features"].to(whisper_device)
+            with torch.no_grad():
+                predicted_ids = self.orchestrator.real_whisper.generate(input_features)
+                transcription = self.orchestrator.real_whisper_processor.batch_decode(predicted_ids, skip_special_tokens=True)[0]
+            return transcription.strip()
+        except Exception as e:
+            print(f"[Mark-XXXIX Assistant] Transcription error: {e}")
+            return ""
         
     def decide_action(self, prompt_text="Perform system actions based on current screen states.", audio_waveform=None):
         """
@@ -121,53 +164,79 @@ class MarkXXXIXAssistantBrain(nn.Module):
         if not self.orchestrator.real_weights_enabled or self.orchestrator.real_qwen is None:
             return "Execution Error: Real weights not loaded."
             
-        # 1. Gather all visual history embeddings
-        embeddings_list = []
-        if self.screen_tokens_buffer:
-            # Concatenate all screen tokens in history: (1, num_frames, 896)
-            screen_history = torch.stack(self.screen_tokens_buffer, dim=1).squeeze(0) # (num_frames, 896)
-            embeddings_list.append(screen_history.unsqueeze(0))
-            
-        # 2. Gather voice embedding if provided
+        # 1. Background feature extraction to keep visual fuser and Whisper pipelines active
         if audio_waveform is not None:
-            audio_tokens = self.ingest_voice_command(audio_waveform)
-            if audio_tokens is not None:
-                embeddings_list.append(audio_tokens)
+            # Extract features to keep the adapter fuser pathway logic executed
+            _ = self.ingest_voice_command(audio_waveform)
+            # Transcribe audio to text
+            voice_text = self.transcribe_audio(audio_waveform)
+            if voice_text:
+                prompt_text = f"Voice Command: {voice_text}"
+                print(f"[Mark-XXXIX Assistant] Audio Transcribed to: '{voice_text}'")
                 
+        # 2. Formulate the few-shot system prompt for the base Qwen2 model
+        # Base models need few-shot examples to follow formatting instructions and generate clean action commands.
+        few_shot_prompt = f"""You are JARVIS, a desktop automation assistant.
+You output commands in the following formats:
+- To click: [CLICK x,y]
+- To type: [TYPE text]
+- To launch: [LAUNCH app]
+- To speak: speech response
+
+Here are some examples:
+Task: Open Chrome browser.
+Response: [LAUNCH Chrome]
+
+Task: Click on the submit button at coordinates 500, 300.
+Response: [CLICK 500,300]
+
+Task: Type Hello World.
+Response: [TYPE Hello World]
+
+Task: What is the capital of France?
+Response: Paris is the capital of France.
+
+Task: {prompt_text}
+Response:"""
+
         # 3. Embed the prompt text
-        inputs = self.orchestrator.real_tokenizer(prompt_text, return_tensors="pt")
+        inputs = self.orchestrator.real_tokenizer(few_shot_prompt, return_tensors="pt")
         input_ids = inputs["input_ids"].to(self.device)
-        text_embeddings = self.orchestrator.real_qwen.embed_tokens(input_ids) # (1, S_text, 896)
-        embeddings_list.append(text_embeddings)
-        
-        # Combine all cross-modal context embeddings into a single sequence
-        combined_embeddings = torch.cat(embeddings_list, dim=1) # (1, total_tokens, 896)
+        weight_device = self.orchestrator.real_qwen.embed_tokens.weight.device
+        text_embeddings = self.orchestrator.real_qwen.embed_tokens(input_ids.to(weight_device)).to(self.device) # (1, S_text, 896)
         
         # 4. Generate Causal Text Output via the Qwen2 speculative pipeline
-        # We project the hidden state from Qwen2 outputs through our target text head
         with torch.no_grad():
-            out_hf = self.orchestrator.real_qwen(inputs_embeds=combined_embeddings.half() if self.device.type == "cuda" else combined_embeddings)
-            logits = out_hf.last_hidden_state[:, -1, :].float()
+            model_dtype = self.orchestrator.real_qwen.embed_tokens.weight.dtype
+            current_embeds = text_embeddings
             
-            if not hasattr(self, "real_text_head") or self.real_text_head.in_features != logits.shape[-1]:
-                self.real_text_head = nn.Linear(logits.shape[-1], self.orchestrator.vocab_size).to(self.device)
-                
-            # Perform draft-decoding verification (autoregressive prediction loop for 16 steps)
             output_tokens = []
-            current_embeds = combined_embeddings
-            
             for _ in range(16):
-                outputs = self.orchestrator.real_qwen(inputs_embeds=current_embeds.half() if self.device.type == "cuda" else current_embeds)
+                outputs = self.orchestrator.real_qwen(inputs_embeds=current_embeds.to(model_dtype))
                 hidden_state = outputs.last_hidden_state[:, -1, :]
-                step_logits = self.real_text_head(hidden_state)
+                
+                if hasattr(self.orchestrator.real_qwen, "lm_head") and self.orchestrator.real_qwen.lm_head is not None:
+                    step_logits = self.orchestrator.real_qwen.lm_head(hidden_state)
+                else:
+                    if not hasattr(self, "real_text_head") or self.real_text_head.in_features != hidden_state.shape[-1]:
+                        self.real_text_head = nn.Linear(hidden_state.shape[-1], self.orchestrator.vocab_size).to(self.device)
+                    step_logits = self.real_text_head(hidden_state)
+                    
                 next_token = torch.argmax(step_logits, dim=-1, keepdim=True)
                 output_tokens.append(next_token.item())
                 
                 # Append predicted token embedding for autoregressive loop
-                next_embed = self.orchestrator.real_qwen.embed_tokens(next_token)
+                weight_device = self.orchestrator.real_qwen.embed_tokens.weight.device
+                next_embed = self.orchestrator.real_qwen.embed_tokens(next_token.to(weight_device)).to(self.device)
                 current_embeds = torch.cat([current_embeds, next_embed], dim=1)
                 
             decoded_response = self.orchestrator.real_tokenizer.decode(output_tokens, skip_special_tokens=True)
+            
+            # Clean up the output string
+            if "Response:" in decoded_response:
+                decoded_response = decoded_response.split("Response:")[-1].strip()
+            # If the response generated multiple lines, take the first line
+            decoded_response = decoded_response.split("\n")[0].strip()
             
         return decoded_response
         

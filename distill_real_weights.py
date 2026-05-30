@@ -184,10 +184,11 @@ def run_real_distillation_test():
 
     # Audio Step
     if audio_model is not None:
-        # Create a mock audio waveform
-        print("Generating mock acoustic input (16000-sample mono)...")
-        import numpy as np
-        mock_waveform = np.sin(np.linspace(0, 440 * 2 * np.pi, 16000))
+        # Create a mock audio waveform using Dask Array
+        import dask.array as da
+        import math
+        da_t = da.linspace(0, 440 * 2 * math.pi, 16000, chunks=4000)
+        mock_waveform = da.sin(da_t).compute()
         inputs = audio_processor(mock_waveform, sampling_rate=16000, return_tensors="pt")
         input_features = inputs["input_features"].to(torch.float16)
         

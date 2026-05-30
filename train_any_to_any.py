@@ -6,6 +6,8 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import time
 import random
+import numpy as np
+import dask.array as da
 from PIL import Image
 
 from any_to_any import AnyToAnyOrchestrator
@@ -70,7 +72,8 @@ class UnifiedMultimodalDataset(Dataset):
             try:
                 path = self.image_files[idx % len(self.image_files)]
                 img = Image.open(path).convert('RGB').resize((64, 64))
-                tensor_img = torch.from_numpy(np.array(img)).float().permute(2, 0, 1) / 255.0
+                da_img = da.from_array(np.array(img), chunks=(32, 32, 3))
+                tensor_img = torch.from_numpy(da_img.compute()).float().permute(2, 0, 1) / 255.0
                 return tensor_img
             except Exception:
                 pass
@@ -87,14 +90,15 @@ class UnifiedMultimodalDataset(Dataset):
                 path = self.audio_files[idx % len(self.audio_files)]
                 from scipy.io import wavfile
                 sample_rate, data = wavfile.read(path)
-                if len(data.shape) > 1:
-                    data = data[:, 0]  # Mono conversion
-                data = data.astype(np.float32) / 32768.0
-                if len(data) < 16000:
-                    data = np.pad(data, (0, 16000 - len(data)))
+                da_data = da.from_array(data, chunks=(8000,))
+                if len(da_data.shape) > 1:
+                    da_data = da_data[:, 0]  # Mono conversion
+                da_data = da_data.astype(np.float32) / 32768.0
+                if len(da_data) < 16000:
+                    da_data = da.pad(da_data, (0, 16000 - len(da_data)), mode='constant')
                 else:
-                    data = data[:16000]
-                return torch.from_numpy(data).unsqueeze(0)
+                    da_data = da_data[:16000]
+                return torch.from_numpy(da_data.compute()).unsqueeze(0)
             except Exception:
                 pass
         return torch.randn(1, 16000)
