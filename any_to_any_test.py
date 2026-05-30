@@ -38,70 +38,73 @@ def test_any_to_any():
     
     print("\nStarting 16-Pathway Execution Loop...\n")
     
+    orchestrator.eval()
+    
     success_count = 0
     t_start_total = time.time()
     
-    for route_idx, route in enumerate(routes, 1):
-        print(f"[{route_idx}/16] Routing: {route.upper()}")
-        t0 = time.time()
-        
-        # Reset memory statistics for individual pathways
-        if device.type == "cuda":
-            torch.cuda.reset_peak_memory_stats()
-            torch.cuda.empty_cache()
+    with torch.no_grad():
+        for route_idx, route in enumerate(routes, 1):
+            print(f"[{route_idx}/16] Routing: {route.upper()}")
+            t0 = time.time()
             
-        try:
-            output = orchestrator.route(
-                mode=route,
-                text_input=mock_text,
-                image_input=mock_image,
-                video_input=mock_video,
-                audio_input=mock_audio,
-                num_frames=4,
-                audio_len=16000
-            )
-            t1 = time.time()
-            elapsed = (t1 - t0) * 1000
-            
-            # Verify output type and shape
-            assert output is not None, "Output is None!"
-            
-            tgt = route.split("_to_")[1]
-            if tgt == "text":
-                # Text logits shape: (B, S, vocab_size)
-                assert len(output.shape) == 3 and output.shape[0] == 1 and output.shape[2] == 32000, \
-                    f"Unexpected text output shape: {output.shape}"
-                shape_str = f"shape: {list(output.shape)}"
-            elif tgt == "image":
-                # Image pixels shape: (B, 3, H, W)
-                assert len(output.shape) == 4 and output.shape[0] == 1 and output.shape[1] == 3, \
-                    f"Unexpected image output shape: {output.shape}"
-                shape_str = f"shape: {list(output.shape)}"
-            elif tgt == "video":
-                # Video frames shape: (B, T, 3, H, W)
-                assert len(output.shape) == 5 and output.shape[0] == 1 and output.shape[1] == 4 and output.shape[2] == 3, \
-                    f"Unexpected video output shape: {output.shape}"
-                shape_str = f"shape: {list(output.shape)}"
-            elif tgt == "audio":
-                # Audio waveform shape: (B, 1, S)
-                assert len(output.shape) == 3 and output.shape[0] == 1 and output.shape[1] == 1 and output.shape[2] == 16000, \
-                    f"Unexpected audio output shape: {output.shape}"
-                shape_str = f"shape: {list(output.shape)}"
-                
-            print(f"  -> SUCCESS | Latency: {elapsed:.2f} ms | Output {shape_str}")
-            
+            # Reset memory statistics for individual pathways
             if device.type == "cuda":
-                allocated = torch.cuda.max_memory_allocated() / (1024 ** 2)
-                reserved = torch.cuda.max_memory_reserved() / (1024 ** 2)
-                print(f"  -> Peak VRAM Allocated: {allocated:.2f} MB | Peak VRAM Reserved: {reserved:.2f} MB")
+                torch.cuda.reset_peak_memory_stats()
+                torch.cuda.empty_cache()
                 
-            success_count += 1
-            
-        except Exception as e:
-            print(f"  -> FAILURE | Reason: {str(e)}")
-            raise e
-            
-        print("-" * 50)
+            try:
+                output = orchestrator.route(
+                    mode=route,
+                    text_input=mock_text,
+                    image_input=mock_image,
+                    video_input=mock_video,
+                    audio_input=mock_audio,
+                    num_frames=4,
+                    audio_len=16000
+                )
+                t1 = time.time()
+                elapsed = (t1 - t0) * 1000
+                
+                # Verify output type and shape
+                assert output is not None, "Output is None!"
+                
+                tgt = route.split("_to_")[1]
+                if tgt == "text":
+                    # Text logits shape: (B, S, vocab_size)
+                    assert len(output.shape) == 3 and output.shape[0] == 1 and output.shape[2] == 32000, \
+                        f"Unexpected text output shape: {output.shape}"
+                    shape_str = f"shape: {list(output.shape)}"
+                elif tgt == "image":
+                    # Image pixels shape: (B, 3, H, W)
+                    assert len(output.shape) == 4 and output.shape[0] == 1 and output.shape[1] == 3, \
+                        f"Unexpected image output shape: {output.shape}"
+                    shape_str = f"shape: {list(output.shape)}"
+                elif tgt == "video":
+                    # Video frames shape: (B, T, 3, H, W)
+                    assert len(output.shape) == 5 and output.shape[0] == 1 and output.shape[1] == 4 and output.shape[2] == 3, \
+                        f"Unexpected video output shape: {output.shape}"
+                    shape_str = f"shape: {list(output.shape)}"
+                elif tgt == "audio":
+                    # Audio waveform shape: (B, 1, S)
+                    assert len(output.shape) == 3 and output.shape[0] == 1 and output.shape[1] == 1 and output.shape[2] == 16000, \
+                        f"Unexpected audio output shape: {output.shape}"
+                    shape_str = f"shape: {list(output.shape)}"
+                    
+                print(f"  -> SUCCESS | Latency: {elapsed:.2f} ms | Output {shape_str}")
+                
+                if device.type == "cuda":
+                    allocated = torch.cuda.max_memory_allocated() / (1024 ** 2)
+                    reserved = torch.cuda.max_memory_reserved() / (1024 ** 2)
+                    print(f"  -> Peak VRAM Allocated: {allocated:.2f} MB | Peak VRAM Reserved: {reserved:.2f} MB")
+                    
+                success_count += 1
+                
+            except Exception as e:
+                print(f"  -> FAILURE | Reason: {str(e)}")
+                raise e
+                
+            print("-" * 50)
         
     t_end_total = time.time()
     total_time = (t_end_total - t_start_total) * 1000
