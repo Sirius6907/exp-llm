@@ -363,6 +363,23 @@ class PixelleSiriusOrchestrator(nn.Module):
         tokens_produced = 0
         t_start = time.time()
         
+        # Phase 4 Real Qwen2 generation path
+        if self.real_weights_enabled and self.real_qwen is not None:
+            input_ids = prompt_tokens.to(self.device)
+            for _ in range(steps):
+                with torch.no_grad():
+                    out_hf = self.real_qwen(input_ids=input_ids)
+                    logits = out_hf.last_hidden_state[:, -1, :] # (B, hidden_dim)
+                    if not hasattr(self, "real_text_head") or self.real_text_head.in_features != logits.shape[-1]:
+                        self.real_text_head = nn.Linear(logits.shape[-1], self.vocab_size).to(self.device)
+                    logits_projected = self.real_text_head(logits)
+                    next_token = torch.argmax(logits_projected, dim=-1, keepdim=True)
+                    input_ids = torch.cat([input_ids, next_token], dim=1)
+                    tokens_produced += 1
+            t_end = time.time()
+            elapsed = t_end - t_start
+            return input_ids, tokens_produced, tokens_produced / elapsed
+        
         # 1. Prefill Phase: Initialize Mamba draft and target states with prompt
         x_prompt_h = torch.zeros(B, prompt_tokens.shape[1], self.vlm_dim, device=self.device)
         x_prompt_h[:, :, 0] = prompt_tokens.float()
@@ -444,8 +461,15 @@ class PixelleSiriusOrchestrator(nn.Module):
         t_start = time.time()
         
         # 1. Project cross-modal SSM context
-        context_h = conditioning_c if conditioning_c is not None else torch.randn(B, 16, self.vlm_dim, device=self.device)
-        cond_projected = self.mcp(context_h) # (B, 16, dit_dim)
+        if self.real_weights_enabled:
+            in_dim = conditioning_c.shape[-1] if conditioning_c is not None else self.vlm_dim
+            if not hasattr(self, "real_mcp") or self.real_mcp.in_features != in_dim:
+                self.real_mcp = nn.Linear(in_dim, self.dit_dim).to(self.device)
+            context_h = conditioning_c if conditioning_c is not None else torch.randn(B, 16, in_dim, device=self.device)
+            cond_projected = self.real_mcp(context_h)
+        else:
+            context_h = conditioning_c if conditioning_c is not None else torch.randn(B, 16, self.vlm_dim, device=self.device)
+            cond_projected = self.mcp(context_h)
         
         # 2. Consistency Denoising Steps based on Target Modality
         if mode == "image":
