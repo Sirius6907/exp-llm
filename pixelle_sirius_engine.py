@@ -541,13 +541,14 @@ class PixelleSiriusOrchestrator(nn.Module):
             for _ in range(steps):
                 with torch.no_grad():
                     out_hf = self.real_qwen(input_ids=input_ids)
-                    logits = out_hf.last_hidden_state[:, -1, :].float() # (B, hidden_dim)
+                    logits = out_hf.last_hidden_state[:, -1, :] # Keep original model dtype
                     if hasattr(self.real_qwen, "lm_head") and self.real_qwen.lm_head is not None:
-                        logits_projected = self.real_qwen.lm_head(logits)
+                        lm_head_dtype = self.real_qwen.lm_head.weight.dtype
+                        logits_projected = self.real_qwen.lm_head(logits.to(lm_head_dtype)).float()
                     else:
                         if not hasattr(self, "real_text_head") or self.real_text_head.in_features != logits.shape[-1]:
                             self.real_text_head = nn.Linear(logits.shape[-1], self.vocab_size).to(self.device)
-                        logits_projected = self.real_text_head(logits)
+                        logits_projected = self.real_text_head(logits.float())
                     next_token = torch.argmax(logits_projected, dim=-1, keepdim=True)
                     input_ids = torch.cat([input_ids, next_token], dim=1)
                     tokens_produced += 1
@@ -887,14 +888,15 @@ class PixelleSiriusOrchestrator(nn.Module):
         with torch.no_grad():
             model_dtype = self.real_qwen.embed_tokens.weight.dtype
             out_hf = self.real_qwen(inputs_embeds=combined_embeddings.to(model_dtype))
-            logits = out_hf.last_hidden_state[:, -1, :].float()
+            logits = out_hf.last_hidden_state[:, -1, :] # Keep original model dtype
             
             if hasattr(self.real_qwen, "lm_head") and self.real_qwen.lm_head is not None:
-                logits_projected = self.real_qwen.lm_head(logits)
+                lm_head_dtype = self.real_qwen.lm_head.weight.dtype
+                logits_projected = self.real_qwen.lm_head(logits.to(lm_head_dtype)).float()
             else:
                 if not hasattr(self, "real_text_head") or self.real_text_head.in_features != logits.shape[-1]:
                     self.real_text_head = nn.Linear(logits.shape[-1], self.vocab_size).to(self.device)
-                logits_projected = self.real_text_head(logits)
+                logits_projected = self.real_text_head(logits.float())
             
             output_tokens = []
             for _ in range(12):
@@ -905,11 +907,12 @@ class PixelleSiriusOrchestrator(nn.Module):
                 combined_embeddings = torch.cat([combined_embeddings, next_emb], dim=1)
                 
                 out_hf = self.real_qwen(inputs_embeds=combined_embeddings.to(model_dtype))
-                logits = out_hf.last_hidden_state[:, -1, :].float()
+                logits = out_hf.last_hidden_state[:, -1, :] # Keep original model dtype
                 if hasattr(self.real_qwen, "lm_head") and self.real_qwen.lm_head is not None:
-                    logits_projected = self.real_qwen.lm_head(logits)
+                    lm_head_dtype = self.real_qwen.lm_head.weight.dtype
+                    logits_projected = self.real_qwen.lm_head(logits.to(lm_head_dtype)).float()
                 else:
-                    logits_projected = self.real_text_head(logits)
+                    logits_projected = self.real_text_head(logits.float())
                 
         decoded_description = self.real_tokenizer.decode(output_tokens, skip_special_tokens=True)
         t_end = time.time()
