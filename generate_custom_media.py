@@ -23,7 +23,7 @@ def run_custom_generation():
     # 1. Initialize Orchestrator with scale_to_300m=True
     orchestrator = PixelleSiriusOrchestrator(
         codebook_size=2048,
-        vlm_dim=2048,
+        vlm_dim=896,
         dit_dim=1024,
         latent_dim=256,
         vocab_size=32000,
