@@ -24,7 +24,8 @@ def run_specific_prompt():
         dit_dim=1024,
         latent_dim=256,
         vocab_size=32000,
-        device="cpu"
+        device="cpu",
+        scale_to_300m=True
     )
     orchestrator.eval()
     

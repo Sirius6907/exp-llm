@@ -82,7 +82,8 @@ def train_rl_mcp_alignment():
       dit_dim=1024,
       latent_dim=256,
       vocab_size=32000,
-      device=device
+      device=device,
+      scale_to_300m=True
   )
   orchestrator.eval()
   
