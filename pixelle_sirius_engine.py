@@ -237,23 +237,53 @@ class ConsistencyDenoisingSolver(nn.Module):
     Multi-Modal Latent Consistency Model (LCM) Denoising Solver.
     Utilizes parameterized boundary-guided maps to resolve visual frame
     and audio latents in only 1 to 4 steps, bypassing 50-step diffusion loops.
+    Supports scaling up to a 300M parameter deep Diffusion Transformer (DiT).
     """
-    def __init__(self, latent_dim=256, condition_dim=1024):
+    def __init__(self, latent_dim=256, condition_dim=1024, scale_to_300m=False):
         super().__init__()
         self.latent_dim = latent_dim
+        self.scale_to_300m = scale_to_300m
         
         # Boundary parameterization maps
         self.proj_cond = nn.Linear(condition_dim, latent_dim)
         self.c_skip = nn.Linear(latent_dim, 1)
         self.c_out = nn.Linear(latent_dim, 1)
         
-        # Target neural denoiser F_theta
-        self.denoiser = nn.Sequential(
-            nn.Linear(latent_dim * 2, latent_dim),
-            nn.LayerNorm(latent_dim),
-            nn.SiLU(),
-            nn.Linear(latent_dim, latent_dim)
-        )
+        if scale_to_300m:
+            # 300M parameter deep Diffusion Transformer (DiT)
+            # 6 layers of 2048-dim transformer blocks = ~300M parameters!
+            self.dit_dim = 2048
+            self.dit_in = nn.Linear(latent_dim * 2, self.dit_dim)
+            
+            class DiTBlock(nn.Module):
+                def __init__(self, dim):
+                    super().__init__()
+                    self.attn = nn.MultiheadAttention(embed_dim=dim, num_heads=8, batch_first=True)
+                    self.norm1 = nn.LayerNorm(dim)
+                    self.norm2 = nn.LayerNorm(dim)
+                    self.ffn = nn.Sequential(
+                        nn.Linear(dim, dim * 4),
+                        nn.SiLU(),
+                        nn.Linear(dim * 4, dim)
+                    )
+                def forward(self, x):
+                    attn_out, _ = self.attn(x, x, x)
+                    x = self.norm1(x + attn_out)
+                    ffn_out = self.ffn(x)
+                    x = self.norm2(x + ffn_out)
+                    return x
+                    
+            self.dit_blocks = nn.ModuleList([DiTBlock(self.dit_dim) for _ in range(6)])
+            self.dit_out = nn.Linear(self.dit_dim, latent_dim)
+            print(f"[ConsistencyDenoisingSolver] Scaling mode enabled. Initialized 300 Million parameter Diffusion Transformer (DiT) solver stack.")
+        else:
+            # Standard neural denoiser F_theta
+            self.denoiser = nn.Sequential(
+                nn.Linear(latent_dim * 2, latent_dim),
+                nn.LayerNorm(latent_dim),
+                nn.SiLU(),
+                nn.Linear(latent_dim, latent_dim)
+            )
 
     def forward(self, x_noise, conditioning_c, num_steps=4):
         """
@@ -273,17 +303,19 @@ class ConsistencyDenoisingSolver(nn.Module):
         
         # Run LCM consistency solver steps
         for step in range(num_steps):
-            # Boundary mapping coefficients
-            # c_skip(t_i) forces output to equal input at boundary conditions
             skip_coeff = torch.sigmoid(self.c_skip(context))
             out_coeff = torch.sigmoid(self.c_out(context))
             
-            # Predict clean latent via parameterized mapping
-            # f_theta(x, t) = c_skip(t)*x + c_out(t)*F_theta(x, t)
             denoiser_input = torch.cat([x, context], dim=-1)
-            denoised_pred = self.denoiser(denoiser_input)
             
-            # Consistency step output projection
+            if self.scale_to_300m:
+                h = self.dit_in(denoiser_input)
+                for block in self.dit_blocks:
+                    h = block(h)
+                denoised_pred = self.dit_out(h)
+            else:
+                denoised_pred = self.denoiser(denoiser_input)
+                
             x = skip_coeff * x + out_coeff * denoised_pred
             
         return x
@@ -295,13 +327,14 @@ class PixelleSiriusOrchestrator(nn.Module):
     and Latent Consistency Models (LCM) to deliver 100+ tokens/sec text throughput
     and sub-second cross-modal generation under a strict 3GB VRAM ceiling.
     """
-    def __init__(self, codebook_size=2048, vlm_dim=2048, dit_dim=1024, latent_dim=256, vocab_size=32000, device="cpu"):
+    def __init__(self, codebook_size=2048, vlm_dim=2048, dit_dim=1024, latent_dim=256, vocab_size=32000, device="cpu", scale_to_300m=False):
         super().__init__()
         self.device = torch.device(device)
         self.vocab_size = vocab_size
         self.latent_dim = latent_dim
         self.vlm_dim = vlm_dim
         self.dit_dim = dit_dim
+        self.scale_to_300m = scale_to_300m
         
         # 1. Speculative Draft & Target Models (SSM)
         # SiriusDraft: Ultra-fast 80M parameter SSM
@@ -318,8 +351,13 @@ class PixelleSiriusOrchestrator(nn.Module):
         self.text_head = nn.Linear(vlm_dim, vocab_size).to(self.device)
         
         # 2. Connectors & Consistency Solvers (LCM)
-        self.mcp = nn.Linear(vlm_dim, dit_dim).to(self.device)
-        self.lcm_solver = ConsistencyDenoisingSolver(latent_dim=latent_dim, condition_dim=dit_dim).to(self.device)
+        if scale_to_300m:
+            from mcp import MobileConditioningProjector
+            self.mcp = MobileConditioningProjector(vlm_dim=vlm_dim, dit_dim=dit_dim, num_layers=4, scale_to_300m=True).to(self.device)
+            self.lcm_solver = ConsistencyDenoisingSolver(latent_dim=latent_dim, condition_dim=dit_dim, scale_to_300m=True).to(self.device)
+        else:
+            self.mcp = nn.Linear(vlm_dim, dit_dim).to(self.device)
+            self.lcm_solver = ConsistencyDenoisingSolver(latent_dim=latent_dim, condition_dim=dit_dim, scale_to_300m=False).to(self.device)
         
         # Simple projection layers for inputs/outputs
         self.image_encoder = nn.Linear(latent_dim, vlm_dim).to(self.device)
