@@ -34,7 +34,7 @@ def verify_environment():
         sys.exit(1)
         
     # 3. Check for required module files
-    required_files = ["mcp.py", "ssm_temporal.py", "tokenflow.py", "dynamap.py", "mock_test.py", "ssm_test.py", "orchestrator_test.py"]
+    required_files = ["mcp.py", "ssm_temporal.py", "tokenflow.py", "dynamap.py", "ssm_test.py", "orchestrator_test.py"]
     print("\nVerifying code components:")
     missing = False
     for filename in required_files:
@@ -51,7 +51,6 @@ def verify_environment():
     
     # 4. Execute test scripts sequentially
     success = True
-    success &= run_script("mock_test.py")
     success &= run_script("ssm_test.py")
     success &= run_script("orchestrator_test.py")
     

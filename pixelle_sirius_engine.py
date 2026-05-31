@@ -5,7 +5,20 @@ import time
 import math
 import random
 import re
+import numpy as np
+import sys
+import os
+
+# Ensure local sirius_ops directory is on the path to import local PyO3 extension
+sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "sirius_ops"))
+
 from sirius_ops import SiriusZeroLossMemory
+
+try:
+    import sirius_ops_rust
+    RUST_AVAILABLE = True
+except ImportError:
+    RUST_AVAILABLE = False
 
 class MambaSelectiveBlock(nn.Module):
     """
@@ -54,6 +67,48 @@ class MambaSelectiveBlock(nn.Module):
         dt = F.softplus(self.dt_proj(dt_raw))
         A = -torch.exp(self.A_log)
         
+        # CPU Rust fast-path for zero-copy sequential Mamba-2 SSM scan loop
+        if RUST_AVAILABLE and x.device.type == "cpu" and not x.requires_grad and B == 1:
+            A_log_np = self.A_log.detach().numpy().astype(np.float32)
+            
+            # Setup constants for Rust step multiplier
+            gate_step_np = np.full(D, 20.0, dtype=np.float32)
+            norm_weight_np = np.full(D, 0.05, dtype=np.float32)
+            
+            # Retrieve starting state (dim x state_dim)
+            if state is not None:
+                h_np = state[0].detach().numpy().astype(np.float32)
+            else:
+                h_np = np.zeros((D, self.state_dim), dtype=np.float32)
+                
+            outputs_np = []
+            for s in range(S):
+                # zero-copy sharing via NumPy shared memory views!
+                x_step_np = x_branch[0, s].detach().numpy().astype(np.float32)
+                dt_step_np = dt[0, s].detach().numpy().astype(np.float32)
+                B_step_np = B_raw[0, s].detach().numpy().astype(np.float32)
+                C_step_np = C_raw[0, s].detach().numpy().astype(np.float32)
+                
+                # Execute in-place bare-metal scan step in Rust
+                y_step_np, _ = sirius_ops_rust.mamba_selective_scan_step_rust(
+                    x_step_np,
+                    gate_step_np,
+                    h_np,
+                    A_log_np,
+                    B_step_np,
+                    C_step_np,
+                    dt_step_np,
+                    norm_weight_np
+                )
+                outputs_np.append(torch.from_numpy(y_step_np))
+                
+            ssm_out = torch.stack(outputs_np, dim=0).unsqueeze(0) # (1, S, D)
+            new_state = torch.from_numpy(h_np).unsqueeze(0) # (1, D, state_dim)
+            
+            blended = self.norm(ssm_out * F.silu(gate_branch))
+            out = self.out_proj(blended)
+            return out, new_state
+
         # 3. Recurrent Scan / Step
         if state is not None:
             # Incremental step mode
@@ -475,13 +530,12 @@ class PixelleSiriusOrchestrator(nn.Module):
             print("[OK] Real weights loaded and integrated successfully.")
         except Exception as e:
             print(f"[FAIL] Could not load real pre-trained weights: {e}")
-            print("Running in synthetic simulation fallback mode.")
+            raise e
 
-    def speculative_text_gen(self, prompt_tokens, steps=50, K_draft=4):
+    def speculative_text_gen(self, prompt_tokens, steps=50, K_draft=4, thinking_mode=True, max_thinking_tokens=100):
         """
-        Executes Speculative Drafting to generate text/code at 100-120 tokens/sec.
-        Leverages Mamba recurrent state caching in both draft and target models
-        to achieve O(1) step latency throughout sequence extension.
+        Executes Speculative Drafting or Real Qwen2 inference with Chain-of-Thought reasoning.
+        Leverages Mamba recurrent state caching in both draft and target models or real Qwen2 text backbones.
         """
         B = prompt_tokens.shape[0]
         generated = prompt_tokens.clone()
@@ -538,20 +592,101 @@ class PixelleSiriusOrchestrator(nn.Module):
         # Phase 4 Real Qwen2 generation path
         if self.real_weights_enabled and self.real_qwen is not None:
             input_ids = prompt_tokens.to(self.device)
-            for _ in range(steps):
-                with torch.no_grad():
-                    out_hf = self.real_qwen(input_ids=input_ids)
-                    logits = out_hf.last_hidden_state[:, -1, :] # Keep original model dtype
-                    if hasattr(self.real_qwen, "lm_head") and self.real_qwen.lm_head is not None:
-                        lm_head_dtype = self.real_qwen.lm_head.weight.dtype
-                        logits_projected = self.real_qwen.lm_head(logits.to(lm_head_dtype)).float()
-                    else:
-                        if not hasattr(self, "real_text_head") or self.real_text_head.in_features != logits.shape[-1]:
-                            self.real_text_head = nn.Linear(logits.shape[-1], self.vocab_size).to(self.device)
-                        logits_projected = self.real_text_head(logits.float())
-                    next_token = torch.argmax(logits_projected, dim=-1, keepdim=True)
-                    input_ids = torch.cat([input_ids, next_token], dim=1)
-                    tokens_produced += 1
+            
+            # Dynamic Causal Thinking Trigger (DCTT)
+            prompt_text = ""
+            if self.real_tokenizer is not None:
+                prompt_text = self.real_tokenizer.decode(prompt_tokens[0].cpu().tolist(), skip_special_tokens=True).lower()
+            
+            reasoning_keywords = ["solve", "why", "explain", "code", "program", "math", "logic", "think", "reason", "calculate", "how", "create a function", "derive"]
+            # Trigger thinking dynamically if prompt matches keywords, or if explicitly enabled
+            should_think = thinking_mode or any(kw in prompt_text for kw in reasoning_keywords)
+            
+            if should_think:
+                print(f"\n[Dynamic Thinking Trigger] Activated internal Chain-of-Thought (CoT) reasoning phase...")
+                cot_prefix = "\nLet's think step-by-step:\n<thought>\n"
+                cot_prefix_ids = self.real_tokenizer.encode(cot_prefix, add_special_tokens=False, return_tensors="pt").to(self.device)
+                
+                # Prepend the thinking sequence
+                input_ids = torch.cat([input_ids, cot_prefix_ids], dim=1)
+                
+                # Step 1: Autoregressively decode reasoning tokens inside <thought> ... </thought>
+                thinking_steps = 0
+                while thinking_steps < max_thinking_tokens:
+                    with torch.no_grad():
+                        out_hf = self.real_qwen(input_ids=input_ids)
+                        logits = out_hf.last_hidden_state[:, -1, :]
+                        if hasattr(self.real_qwen, "lm_head") and self.real_qwen.lm_head is not None:
+                            lm_head_dtype = self.real_qwen.lm_head.weight.dtype
+                            logits_projected = self.real_qwen.lm_head(logits.to(lm_head_dtype)).float()
+                        else:
+                            if not hasattr(self, "real_text_head") or self.real_text_head.in_features != logits.shape[-1]:
+                                self.real_text_head = nn.Linear(logits.shape[-1], self.vocab_size).to(self.device)
+                            logits_projected = self.real_text_head(logits.float())
+                        
+                        next_token = torch.argmax(logits_projected, dim=-1, keepdim=True)
+                        input_ids = torch.cat([input_ids, next_token], dim=1)
+                        tokens_produced += 1
+                        thinking_steps += 1
+                        
+                        # Check if we generated </thought>
+                        thought_seq = input_ids[0, prompt_tokens.shape[1] + cot_prefix_ids.shape[1]:]
+                        thought_text = self.real_tokenizer.decode(thought_seq, skip_special_tokens=True)
+                        if "</thought>" in thought_text:
+                            break
+                
+                # Append </thought> if not generated within max limit
+                if "</thought>" not in thought_text:
+                    closing_ids = self.real_tokenizer.encode("\n</thought>", add_special_tokens=False, return_tensors="pt").to(self.device)
+                    input_ids = torch.cat([input_ids, closing_ids], dim=1)
+                    
+                # Append transition prefix
+                transition_prefix = "\nAnswer:\n"
+                transition_ids = self.real_tokenizer.encode(transition_prefix, add_special_tokens=False, return_tensors="pt").to(self.device)
+                input_ids = torch.cat([input_ids, transition_ids], dim=1)
+                
+                # Step 2: Decode the clear, precise final response
+                for _ in range(steps):
+                    with torch.no_grad():
+                        out_hf = self.real_qwen(input_ids=input_ids)
+                        logits = out_hf.last_hidden_state[:, -1, :]
+                        if hasattr(self.real_qwen, "lm_head") and self.real_qwen.lm_head is not None:
+                            lm_head_dtype = self.real_qwen.lm_head.weight.dtype
+                            logits_projected = self.real_qwen.lm_head(logits.to(lm_head_dtype)).float()
+                        else:
+                            logits_projected = self.real_text_head(logits.float())
+                        
+                        next_token = torch.argmax(logits_projected, dim=-1, keepdim=True)
+                        input_ids = torch.cat([input_ids, next_token], dim=1)
+                        tokens_produced += 1
+                
+                # Step 3: Handle explicit vs. silent thoughts
+                if not thinking_mode:
+                    # Strip thoughts from returned output sequence
+                    answer_start_offset = prompt_tokens.shape[1] + cot_prefix_ids.shape[1] + thinking_steps
+                    if "</thought>" not in thought_text:
+                        answer_start_offset += closing_ids.shape[1]
+                    answer_start_offset += transition_ids.shape[1]
+                    
+                    answer_tokens = input_ids[:, answer_start_offset:]
+                    input_ids = torch.cat([prompt_tokens.to(self.device), answer_tokens], dim=1)
+            else:
+                # Standard generation path without thinking
+                for _ in range(steps):
+                    with torch.no_grad():
+                        out_hf = self.real_qwen(input_ids=input_ids)
+                        logits = out_hf.last_hidden_state[:, -1, :]
+                        if hasattr(self.real_qwen, "lm_head") and self.real_qwen.lm_head is not None:
+                            lm_head_dtype = self.real_qwen.lm_head.weight.dtype
+                            logits_projected = self.real_qwen.lm_head(logits.to(lm_head_dtype)).float()
+                        else:
+                            if not hasattr(self, "real_text_head") or self.real_text_head.in_features != logits.shape[-1]:
+                                self.real_text_head = nn.Linear(logits.shape[-1], self.vocab_size).to(self.device)
+                            logits_projected = self.real_text_head(logits.float())
+                        next_token = torch.argmax(logits_projected, dim=-1, keepdim=True)
+                        input_ids = torch.cat([input_ids, next_token], dim=1)
+                        tokens_produced += 1
+            
             t_end = time.time()
             elapsed = t_end - t_start
             return input_ids, tokens_produced, tokens_produced / elapsed
@@ -947,4 +1082,58 @@ class PixelleSiriusOrchestrator(nn.Module):
             
         print(f"[Phase 5] Long context prefill successfully completed. Final state initialized.")
         return draft_state, target_states
+
+    def save_sirius_weights(self, filepath, quantize=False):
+        """
+        Saves all trainable MCP adapter and Consistency Solver weights in the custom .sirius V2.0 format.
+        Supports dynamic 8-bit quantization compression.
+        """
+        from sirius_framework import SiriusFramework
+        import time
+        trainable_weights = {}
+        if hasattr(self, "mcp") and self.mcp is not None:
+            trainable_weights.update(self.mcp.state_dict())
+        if hasattr(self, "lcm_solver") and self.lcm_solver is not None:
+            trainable_weights.update(self.lcm_solver.state_dict())
+            
+        config = {
+            "engine": "PixelleSiriusOrchestrator",
+            "vlm_dim": self.vlm_dim,
+            "dit_dim": self.dit_dim,
+            "latent_dim": self.latent_dim,
+            "vocab_size": self.vocab_size,
+            "device": str(self.device),
+            "timestamp": time.time(),
+            "quantized": quantize
+        }
+            
+        SiriusFramework.save_file(trainable_weights, filepath, config=config, quantize=quantize)
+        
+    def load_sirius_weights(self, filepath):
+        """
+        Loads aligned adapter weights directly from our custom .sirius V2.0 format with zero-copy speed and auto-dequantization.
+        """
+        from sirius_framework import SiriusFramework
+        loaded, config = SiriusFramework.load_file(filepath, device=self.device)
+        
+        # Load weights into active modules
+        mcp_state = {}
+        lcm_state = {}
+        for k, v in loaded.items():
+            if k.startswith("mcp") or hasattr(self, "mcp") and k in self.mcp.state_dict():
+                mcp_state[k] = v
+            else:
+                lcm_state[k] = v
+                
+        if mcp_state and hasattr(self, "mcp") and self.mcp is not None:
+            self.mcp.load_state_dict(mcp_state, strict=False)
+            print(f"[Engine] Successfully loaded MCP weights from custom .sirius format.")
+        if lcm_state and hasattr(self, "lcm_solver") and self.lcm_solver is not None:
+            self.lcm_solver.load_state_dict(lcm_state, strict=False)
+            print(f"[Engine] Successfully loaded LCM Solver weights from custom .sirius format.")
+            
+        print(f"[Engine] Metadata Loaded: {config}")
+        return config
+
+
 

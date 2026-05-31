@@ -6,14 +6,13 @@ This report provides an empirical verification checklist confirming the operatio
 
 | Verification Phase | Script / Command | Target Constraint | Elapsed Time | Status |
 | :--- | :--- | :--- | :--- | :--- |
-| mock_test.py | `mock_test.py` | Stable Convergence / Latency | 2.10s | **[PASS]** |
-| ssm_test.py | `ssm_test.py` | Stable Convergence / Latency | 1.97s | **[PASS]** |
-| orchestrator_test.py | `orchestrator_test.py` | Stable Convergence / Latency | 3.90s | **[PASS]** |
-| test_ssm_coherence.py | `test_ssm_coherence.py` | Stable Convergence / Latency | 3.47s | **[PASS]** |
-| test_cinematic_suite.py | `test_cinematic_suite.py` | Stable Convergence / Latency | 28.26s | **[PASS]** |
-| train_mcp_real.py | `train_mcp_real.py` | Stable Convergence / Latency | 110.76s | **[PASS]** |
-| train_rl.py | `train_rl.py` | Stable Convergence / Latency | 46.91s | **[PASS]** |
-| test_zero_loss_training.py | `test_zero_loss_training.py` | Stable Convergence / Latency | 5.27s | **[PASS]** |
+| ssm_test.py | `ssm_test.py` | Stable Convergence / Latency | 1.82s | **[PASS]** |
+| orchestrator_test.py | `orchestrator_test.py` | Stable Convergence / Latency | 3.48s | **[PASS]** |
+| test_ssm_coherence.py | `test_ssm_coherence.py` | Stable Convergence / Latency | 1.77s | **[PASS]** |
+| test_cinematic_suite.py | `test_cinematic_suite.py` | Stable Convergence / Latency | 76.27s | **[FAIL]** |
+| train_mcp_real.py | `train_mcp_real.py` | Stable Convergence / Latency | 624.47s | **[PASS]** |
+| train_rl.py | `train_rl.py` | Stable Convergence / Latency | 42.34s | **[PASS]** |
+| test_zero_loss_training.py | `test_zero_loss_training.py` | Stable Convergence / Latency | 4.62s | **[PASS]** |
 
 ---
 

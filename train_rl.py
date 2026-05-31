@@ -22,14 +22,24 @@ class VisualPreferenceDataset(Dataset):
     self.num_samples = num_samples
     self.dit_dim = dit_dim
     self.prompts = [
-        "A hyper-realistic cinematic render of an ancient temple, golden hour",
-        "Cyberpunk street with glowing neon signs and heavy rain reflections",
-        "A majestic glowing phoenix rising from dark volcanic ash",
-        "Cozy wooden cabin in a snowy forest under the aurora borealis",
-        "Vibrant coral reef teeming with marine life, shafts of sunlight",
-        "A sleek futuristic sports car speeding through a desert canyon",
-        "Deep space nebula with swirling cosmic dust and distant galaxies",
-        "An elegant white stallion running wild along a pristine beach at sunset"
+        # 1. Sports & Action
+        "A young boy playing cricket on a green grass field under sunny bokeh, highly detailed high pixel density",
+        "A fast bowler running up to bowl, motion blur, grass textures, sun-drenched field",
+        "A batter hitting a six, stadium lights, crowd background, high contrast cinematic rendering",
+        # 2. Bonsai & Zen Aesthetics
+        "A majestic ancient juniper bonsai tree, sculpted with intricate detail, bathed in ethereal warm sunlight, high pixel density",
+        "Delicate cherry blossom bonsai, petals gently falling in a serene Japanese garden, watercolor style, soft bokeh",
+        "A miniature ancient maple bonsai on a rustic wooden table with misty mountain backdrop, photorealistic depth of field",
+        "Sentient pine bonsai tree in a ceramic pot, minimalist zen garden backdrop, morning light ray projection",
+        # 3. Sci-Fi & Technology
+        "A beautiful sci-fi arc reactor glowing in a dark lab, high pixel density copper coils",
+        "Cyberpunk street filled with rain reflections, glowing neon signs, steam rising from grates",
+        "Close up portrait of an astronaut with earth in helmet reflection, photorealistic, 8k details",
+        # 4. Landscapes & Nature
+        "A serene mountain lake at sunrise, emerald green water reflecting razor-sharp snow peaks, highly detailed",
+        "Vibrant coral reef underwater scene, sun rays shining through crystal water, exotic colorful fish",
+        "An ancient forest with mystical glowing mushrooms, mossy trees, thick morning fog, fantasy lighting",
+        "Sunset over a sprawling cybernetic metropolis skyline, massive skyscrapers, glowing highways"
     ]
 
   def __len__(self):
@@ -166,7 +176,7 @@ def train_rl_mcp_alignment():
   print("==================================================")
   
   t_start = time.time()
-  epochs = 2
+  epochs = 5
   
   for epoch in range(epochs):
     epoch_loss = 0.0

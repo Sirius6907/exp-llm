@@ -1,0 +1,15 @@
+[package]
+name = "sirius_ops_rust"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "sirius_ops_rust"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.20", features = ["extension-module"] }
+rayon = "1.8"
+ndarray = "0.15"
+num-traits = "0.2"
+numpy = "0.20"

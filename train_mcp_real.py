@@ -17,22 +17,65 @@ class RealTextPromptDataset(Dataset):
     """
     def __init__(self):
         self.prompts = [
-            "Futuristic neon city abstract artwork, glowing lights",
-            "A serene mountain lake at sunrise, highly detailed",
-            "Cyberpunk street filled with rain reflections and signs",
-            "A majestic flying dragon soaring through stormy clouds",
-            "Minimalist architectural design, modern concrete villa",
-            "Deep space exploration vehicle approaching a black hole",
-            "Vibrant coral reef underwater scene with exotic fish",
-            "An ancient forest with mystical glowing mushrooms and fog",
-            "Steampunk airship docked at a retro-futuristic terminal",
-            "Close up portrait of an astronaut with earth in helmet reflection",
-            "A cozy cabin in the woods surrounded by autumn leaves",
-            "Hyper-detailed fantasy map of a legendary empire",
-            "Geometric patterns morphing in a digital dimension",
-            "An elegant white horse running along a sandy beach",
-            "Sunset over a sprawling cybernetic metropolis skyline",
-            "A cute red panda playing in the snow, warm lighting"
+            # 1. Sports & Action (Target quality!)
+            "A young boy playing cricket on a green grass field under sunny bokeh, highly detailed high pixel density",
+            "A fast bowler running up to bowl, motion blur, grass textures, sun-drenched field",
+            "A batter hitting a six, stadium lights, crowd background, high contrast cinematic rendering",
+            "A close-up of a red leather cricket ball resting on dew-covered grass, macro photo",
+            "An athletic child playing football in a sunny backyard park, warm golden hour reflections",
+            # 2. Bonsai & Zen Aesthetics (Bonsai-style!)
+            "A majestic ancient juniper bonsai tree, sculpted with intricate detail, bathed in ethereal warm sunlight, high pixel density",
+            "Delicate cherry blossom bonsai, petals gently falling in a serene Japanese garden, watercolor style, soft bokeh",
+            "A miniature ancient maple bonsai on a rustic wooden table with misty mountain backdrop, photorealistic depth of field",
+            "Sentient pine bonsai tree in a ceramic pot, minimalist zen garden backdrop, morning light ray projection",
+            "Ancient gnarled bonsai tree sculpted over mossy rocks, ethereal misty moonlight sumi-e style",
+            # 3. Sci-Fi & Technology
+            "A beautiful sci-fi arc reactor glowing in a dark lab, high pixel density copper coils",
+            "Cyberpunk street filled with rain reflections, glowing neon signs, steam rising from grates",
+            "Deep space exploration vehicle approaching a massive black hole, accretion disk glowing brightly",
+            "Steampunk airship docked at a retro-futuristic iron terminal, steam clouds, brass gears",
+            "Close up portrait of an astronaut with earth in helmet reflection, photorealistic, 8k details",
+            "A glowing quantum computer core floating inside a futuristic white laboratory, clean sci-fi style",
+            "A futuristic android sitting at a workbench, glowing blue circuit lines visible under transparent skin",
+            "Cybernetic bio-dome containing a small glowing neon forest under a star-filled dome",
+            # 4. Landscapes & Nature
+            "A serene mountain lake at sunrise, emerald green water reflecting razor-sharp snow peaks, highly detailed",
+            "Vibrant coral reef underwater scene, sun rays shining through crystal water, exotic colorful fish",
+            "An ancient forest with mystical glowing mushrooms, mossy trees, thick morning fog, fantasy lighting",
+            "A cozy cabin in the woods surrounded by autumn leaves, warm chimney smoke, cinematic depth of field",
+            "Sunset over a sprawling cybernetic metropolis skyline, massive skyscrapers, glowing highways",
+            "A cute red panda playing in the snow, warm sunbeams filtering through pine branches, hyperdetailed",
+            "A massive cascading waterfall plunging into a deep misty canyon, double rainbow, pristine nature",
+            "A pristine white sand beach at sunset, gentle turquoise waves, palm tree silhouettes",
+            "Golden desert dunes under a vast clear night sky filled with millions of sparkling stars and the Milky Way",
+            "Ethereal ice cave with glowing blue crystal formations, light reflecting off glacial walls",
+            # 5. Portrait & Character
+            "Close-up portrait of an old wise man with deep wrinkles, warm sunset lighting, highly detailed skin pores",
+            "A young female warrior in silver armor looking forward, wind blowing her hair, ancient forest background",
+            "A cybernetic hacker with glowing neural interface headgear, multiple holographic screens reflecting in glasses",
+            "A cute sleeping kitten nestled inside a warm knitted wool blanket, cozy soft-focus lighting",
+            "A majestic bald eagle perched on a high pine branch, razor-sharp feathers, piercing eyes, cloudy sky",
+            # 6. Abstract & Geometry
+            "Geometric patterns morphing in a digital dimension, swirling glowing fractals, high-frequency grids",
+            "Abstract watercolor splash of blue and gold, fluid dynamic paint flow, elegant canvas textures",
+            "A flowing river of liquid rainbow light cascading through a dark minimalist landscape",
+            "Vortex of glowing neon geometric lines, high-frequency mathematical grids, deep perspective",
+            # 7. Additional Fine-Grained High-Aesthetic Prompts
+            "A retro vintage typewriter sitting on a mahogany desk, sunbeam highlighting brass keys and paper",
+            "A slice of fresh strawberry cake on a marble plate, macro lens, detailed crumbs, glossy glaze",
+            "An elegant white horse running wild along a pristine beach at sunset, splashing water droplets",
+            "A beautiful medieval library with massive wooden bookshelves, dusty light shafts illuminating ancient books",
+            "An ornate gold pocket watch resting on a stack of handwritten letters, classic warm lighting",
+            "A futuristic city built inside a colossal canyon, vertical farming towers, flying solar gliders",
+            "A glowing mystical jellyfish floating in the dark deep ocean, long trailing tentacles, bioluminescent",
+            "A rustic stone cottage in a lush green valley filled with blooming wildflowers, morning dew",
+            "A sleek silver sports car speeding down a wet highway at dusk, glowing taillight trails, high shutter speed",
+            "A futuristic greenhouse in a space station filled with exotic plants, view of Saturn out the window",
+            "A warm cup of coffee with beautiful latte art, steam rising, cozy dark wood coffee shop background",
+            "A fantasy wizard tower built on a floating rock island, magical energy beams, stormy sky",
+            "A majestic peacock displaying its iridescent feathers, micro-detailed patterns, soft sun-drenched background",
+            "A high-tech control room with large wrap-around display screens showing global network maps",
+            "A cozy library room with a fireplace, leather armchair, warm rug, bookshelves, and falling snow outside"
         ]
 
     def __len__(self):
@@ -92,7 +135,7 @@ def train_real_mcp_adapter():
     # 4. Setup Train and Validation Dataloaders (80% / 20% split)
     full_dataset = RealTextPromptDataset()
     # Multiply prompts to simulate a larger dataset for high-throughput pipeline testing
-    full_dataset.prompts = full_dataset.prompts * 32  # 512 samples
+    full_dataset.prompts = full_dataset.prompts * 32  # 1664 samples
     
     split_idx = int(len(full_dataset.prompts) * 0.8)
     
@@ -133,7 +176,7 @@ def train_real_mcp_adapter():
     print("==================================================")
     
     t_start = time.time()
-    epochs = 3
+    epochs = 5
     
     for epoch in range(epochs):
         epoch_loss = 0.0

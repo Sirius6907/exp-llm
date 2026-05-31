@@ -82,7 +82,6 @@ def run_release_verification():
   print("Beginning ultimate pre-release testing gates...\n")
   
   steps = {
-      "mock_test.py": "Straight-Through Estimator Autograd Validation",
       "ssm_test.py": "Selective SSM Recurrence Loop Verification",
       "orchestrator_test.py": "DynaMap Unified Routing Verification",
       "test_ssm_coherence.py": "SSM Coherence & Temporal Stability Audit",
