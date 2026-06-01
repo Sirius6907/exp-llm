@@ -12,19 +12,26 @@ class HighPixelDensityEnhancer:
     Texture Enhancer (PHFTE) and Non-Parametric Semantic Retrievable Blender (NPSRB).
     """
     @staticmethod
-    def enhance_image(latents, prompt, ratio_w=1.0, ratio_h=1.0, display_height=512, display_width=512, device="cpu"):
+    def enhance_image(latents, prompt, ratio_w=1.0, ratio_h=1.0, display_height=512, display_width=512, device="cpu", model=None):
         """
         Enhances low-frequency LCM latents to a razor-sharp, photorealistic high pixel density representation.
         """
         B, H_g, W_g, D = latents.shape
         
         # 1. Project high-dimensional consistency latents to base RGB
-        generator = torch.Generator(device=device).manual_seed(42)
-        proj_matrix = torch.randn(D, 3, generator=generator, device=device)
-        proj_matrix = proj_matrix / proj_matrix.norm(dim=0, keepdim=True)
-        
-        rgb = torch.matmul(latents, proj_matrix)
-        rgb_image = torch.sigmoid(rgb) # Shape: (B, H_g, W_g, 3)
+        from pixelle_sirius_engine import StableDiffusionVAEDecoder
+        if model is not None and hasattr(model, "image_decoder") and isinstance(model.image_decoder, StableDiffusionVAEDecoder):
+            with torch.no_grad():
+                # Real VAE decode call!
+                rgb_tensor = model.image_decoder(latents, h_g=H_g, w_g=W_g, decode_to_rgb=True) # (B, 3, H_g*8, W_g*8)
+                # Permute to (B, H_g*8, W_g*8, 3)
+                rgb_image = rgb_tensor.permute(0, 2, 3, 1)
+        else:
+            generator = torch.Generator(device=device).manual_seed(42)
+            proj_matrix = torch.randn(D, 3, generator=generator, device=device)
+            proj_matrix = proj_matrix / proj_matrix.norm(dim=0, keepdim=True)
+            rgb = torch.matmul(latents, proj_matrix)
+            rgb_image = torch.sigmoid(rgb) # Shape: (B, H_g, W_g, 3)
         
         # Convert to CHW and upscale bilinearly to target display resolution
         rgb_chw = rgb_image.permute(0, 3, 1, 2)
@@ -35,55 +42,8 @@ class HighPixelDensityEnhancer:
             align_corners=False
         ) # (B, 3, H_d, W_d)
         
-        # 2. Non-Parametric Semantic Retrievable Blender (NPSRB)
-        ref_image = None
+        # 2. Non-Parametric Semantic Retrievable Blender (NPSRB) - Gated/Deactivated for Honest Output
         prompt_lower = prompt.lower() if prompt is not None else ""
-        
-        # Look for cricket / boy / grass play matches
-        if any(w in prompt_lower for w in ["cricket", "boy", "play", "batting", "match", "field", "kid"]):
-            ref_path = "cricket_boy.png"
-            if os.path.exists(ref_path):
-                ref_image = ref_path
-        elif any(w in prompt_lower for w in ["reactor", "glow", "cyber", "lab", "sci-fi", "futuristic"]):
-            ref_path = "custom_reactor.png"
-            if os.path.exists(ref_path):
-                ref_image = ref_path
-        elif any(w in prompt_lower for w in ["sunset", "window", "house", "cabin", "sun"]):
-            ref_path = "custom_sunset.png"
-            if os.path.exists(ref_path):
-                ref_image = ref_path
-                
-        if ref_image is not None:
-            try:
-                # Load the high-fidelity detailed asset
-                pil_img = Image.open(ref_image).convert("RGB")
-                pil_img = pil_img.resize((display_width, display_height), Image.Resampling.LANCZOS)
-                ref_tensor = torch.from_numpy(np.array(pil_img)).float().to(device) / 255.0 # (H_d, W_d, 3)
-                ref_tensor = ref_tensor.unsqueeze(0).permute(0, 3, 1, 2) # (B, 3, H_d, W_d)
-                
-                # Expand ref_tensor to batch size B if necessary (e.g. for video frames)
-                if ref_tensor.shape[0] != B:
-                    ref_tensor = ref_tensor.expand(B, -1, -1, -1)
-                
-                # Dynamic Gaussian Blend Mask based on low-frequency model activations
-                lcm_mask = upsampled.mean(dim=1, keepdim=True) # (B, 1, H_d, W_d)
-                lcm_mask = (lcm_mask - lcm_mask.min()) / (lcm_mask.max() - lcm_mask.min() + 1e-6)
-                
-                # Laplacian edge/high-frequency pixel details extraction
-                ref_gray = ref_tensor.mean(dim=1, keepdim=True)
-                blur_kernel = torch.ones(1, 1, 5, 5, device=device) / 25.0
-                ref_blurred = torch.nn.functional.conv2d(ref_gray, blur_kernel, padding=2)
-                high_freq_details = ref_gray - ref_blurred
-                
-                # Blend detailed textures modulated by the model's layout
-                enhanced = upsampled + 0.35 * high_freq_details * (1.0 - lcm_mask)
-                
-                # Also blend in actual reference pixels to introduce high pixel density realism
-                enhanced = 0.35 * enhanced + 0.65 * ref_tensor
-                upsampled = torch.clamp(enhanced, 0.0, 1.0)
-                print(f"[NPSRB] Successfully matched prompt to reference '{ref_image}' and injected high-pixel density details!")
-            except Exception as e:
-                print(f"[NPSRB Warning] Failed to blend reference image: {e}")
                 
         # 3. Procedural High-Frequency Texture Enhancer (PHFTE)
         # Generate custom-tailored procedural details based on semantic intent
@@ -229,7 +189,8 @@ class PixelleSiriusImageGen:
             ratio_h=h_r,
             display_height=display_height,
             display_width=display_width,
-            device=device
+            device=device,
+            model=model
         )
         
         # 4. Standard ComfyUI LATENT dictionary output: samples shape (B, D, H, W)
@@ -305,7 +266,8 @@ class PixelleSiriusVideoGen:
             ratio_h=h_r,
             display_height=display_height,
             display_width=display_width,
-            device=device
+            device=device,
+            model=model
         )
         
         # 4. Latent representation for ComfyUI: (S_frames, D, H, W)
@@ -372,7 +334,8 @@ class PixelleSiriusVideoEdit:
             ratio_h=float(H),
             display_height=display_height,
             display_width=display_width,
-            device=device
+            device=device,
+            model=model
         )
         
         # 4. Latent output
