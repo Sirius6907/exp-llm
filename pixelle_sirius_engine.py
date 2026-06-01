@@ -481,10 +481,19 @@ class StableDiffusionVAEDecoder(nn.Module):
         try:
             from diffusers import AutoencoderKL
             target_dtype = torch.float16 if self.device.type != "cpu" else torch.float32
-            self.vae = AutoencoderKL.from_pretrained(
-                "stabilityai/sd-vae-ft-mse",
-                torch_dtype=target_dtype
-            ).to(self.device)
+            try:
+                # Try loading locally first for speed and offline stability
+                self.vae = AutoencoderKL.from_pretrained(
+                    "stabilityai/sd-vae-ft-mse",
+                    torch_dtype=target_dtype,
+                    local_files_only=True
+                ).to(self.device)
+            except Exception:
+                # Fall back to standard loading (fetching from HF hub if needed)
+                self.vae = AutoencoderKL.from_pretrained(
+                    "stabilityai/sd-vae-ft-mse",
+                    torch_dtype=target_dtype
+                ).to(self.device)
             self.vae.eval()
             print("[VAE Decoder] SD VAE successfully loaded and connected.")
         except Exception as e:
@@ -561,6 +570,7 @@ class PixelleSiriusOrchestrator(nn.Module):
         self.router = SparseMoERouter(dim=vlm_dim, num_experts=3).to(self.device)
         
         # Text Vocab Projections
+        self.text_embedding = nn.Embedding(vocab_size, vlm_dim).to(self.device)
         self.text_head = nn.Linear(vlm_dim, vocab_size).to(self.device)
         
         # ByteDance Lance-Inspired Modality-Aware Rotary Positional Embedding (MaPE)
@@ -948,8 +958,7 @@ class PixelleSiriusOrchestrator(nn.Module):
             return input_ids, tokens_produced, tokens_produced / elapsed
         
         # 1. Prefill Phase: Initialize Mamba draft and target states with prompt
-        x_prompt_h = torch.zeros(B, prompt_tokens.shape[1], self.vlm_dim, device=self.device)
-        x_prompt_h[:, :, 0] = prompt_tokens.float()
+        x_prompt_h = self.text_embedding(prompt_tokens % self.vocab_size)
         
         # Apply MaPE to the prompt hidden states
         if hasattr(self, "mape"):
@@ -967,8 +976,7 @@ class PixelleSiriusOrchestrator(nn.Module):
             
             # Fast O(1) drafting loop
             for _ in range(K_draft):
-                x_step_h = torch.zeros(B, 1, self.vlm_dim, device=self.device)
-                x_step_h[:, :, 0] = last_token.float()
+                x_step_h = self.text_embedding(last_token % self.vocab_size)
                 
                 # Apply MaPE to step hidden states
                 if hasattr(self, "mape"):
@@ -986,8 +994,7 @@ class PixelleSiriusOrchestrator(nn.Module):
             
             # 3. Parallel Target Verification Phase: Verify candidate block using cached target states
             # We ONLY pass the K_draft candidates through the target experts using the cached target_states
-            x_target_step_h = torch.zeros(B, K_draft, self.vlm_dim, device=self.device)
-            x_target_step_h[:, :, 0] = draft_block.float()
+            x_target_step_h = self.text_embedding(draft_block % self.vocab_size)
             
             # Apply MaPE to verification block
             if hasattr(self, "mape"):
@@ -1013,8 +1020,7 @@ class PixelleSiriusOrchestrator(nn.Module):
             generated = torch.cat([generated, new_tokens], dim=1)
             
             # Update the main draft_state by running a prefill step on the accepted tokens
-            x_update_h = torch.zeros(B, new_tokens.shape[1], self.vlm_dim, device=self.device)
-            x_update_h[:, :, 0] = new_tokens.float()
+            x_update_h = self.text_embedding(new_tokens % self.vocab_size)
             if hasattr(self, "mape"):
                 x_update_h = self.mape(x_update_h, modality_type="text")
                 
@@ -1535,8 +1541,7 @@ class PixelleSiriusOrchestrator(nn.Module):
             B_chunk, S_chunk = chunk.shape
             
             # Map chunk tokens to our hidden dimensions
-            x_chunk_h = torch.zeros(B_chunk, S_chunk, self.vlm_dim, device=self.device, dtype=torch.float32)
-            x_chunk_h[:, :, 0] = chunk.float()
+            x_chunk_h = self.text_embedding(chunk % self.vocab_size)
             
             # Apply MaPE to chunk hidden states
             if hasattr(self, "mape"):
