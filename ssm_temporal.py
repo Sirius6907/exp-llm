@@ -12,6 +12,7 @@ class SelectiveSSM(nn.Module):
         super().__init__()
         self.dim = dim
         self.state_dim = state_dim
+        self.dt_rank = dt_rank
         
         # S4 parameter A (log scale initialization to enforce stability)
         self.A_log = nn.Parameter(torch.log(torch.arange(1, state_dim + 1, dtype=torch.float32).view(1, 1, -1)))
@@ -49,7 +50,7 @@ class SelectiveSSM(nn.Module):
         # 2. Project input to selective inputs (Delta, B, C)
         # x_proj_out shape: (B, L, dt_rank + state_dim * 2)
         proj_out = self.x_proj(x)
-        dt_rank_out, B_out, C_out = torch.split(proj_out, [self.x_proj.in_features if hasattr(self, 'dt_rank') else 16, self.state_dim, self.state_dim], dim=-1)
+        dt_rank_out, B_out, C_out = torch.split(proj_out, [self.dt_rank, self.state_dim, self.state_dim], dim=-1)
         
         # 3. Compute step size delta and project to channel dimension: shape (B, L, D)
         dt = F.softplus(self.dt_proj(dt_rank_out)) 

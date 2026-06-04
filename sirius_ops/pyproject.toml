@@ -1,0 +1,12 @@
+[build-system]
+requires = ["maturin>=1.0"]
+build-backend = "maturin"
+
+[project]
+name = "sirius-ops-rust"
+version = "0.1.0"
+requires-python = ">=3.8"
+
+[tool.maturin]
+module-name = "sirius_ops_rust"
+manifest-path = "rust_src/Cargo.toml"

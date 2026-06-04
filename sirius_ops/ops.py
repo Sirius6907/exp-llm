@@ -3,9 +3,8 @@ import torch
 def fast_cosine_similarity(a, b):
     """
     Computes the cosine similarity between two 1D PyTorch tensors.
-    Optimized for execution with low computational power and minimal allocation overhead.
+    Truncates to the shorter vector's length to avoid silent dimension mismatch.
     """
-    # Ensure they are 1D float tensors
     if not isinstance(a, torch.Tensor):
         a = torch.tensor(a, dtype=torch.float32)
     if not isinstance(b, torch.Tensor):
@@ -14,11 +13,11 @@ def fast_cosine_similarity(a, b):
     a = a.view(-1)
     b = b.view(-1)
     
-    # Pad to equal length if needed (e.g. sequence length mismatch)
+    # Truncate to common length to avoid zero-padding distortion
     if a.shape[0] != b.shape[0]:
-        max_len = max(a.shape[0], b.shape[0])
-        a = torch.nn.functional.pad(a, (0, max_len - a.shape[0]))
-        b = torch.nn.functional.pad(b, (0, max_len - b.shape[0]))
+        min_len = min(a.shape[0], b.shape[0])
+        a = a[:min_len]
+        b = b[:min_len]
         
     dot_product = torch.dot(a, b)
     norm_a = torch.linalg.norm(a)

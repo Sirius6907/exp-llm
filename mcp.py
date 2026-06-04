@@ -89,6 +89,9 @@ class LayerwiseFeatureFusion(nn.Module):
     def forward(self, layer_hidden_states):
         if isinstance(layer_hidden_states, list):
             layer_hidden_states = torch.stack(layer_hidden_states, dim=0)
+        elif isinstance(layer_hidden_states, torch.Tensor) and len(layer_hidden_states.shape) == 3:
+            # Single 3D tensor: duplicate to match num_layers for weighting
+            layer_hidden_states = layer_hidden_states.unsqueeze(0).repeat(self.weights.shape[0], 1, 1, 1)
             
         norm_weights = F.softmax(self.weights / self.temp, dim=0)
         norm_weights = norm_weights.view(-1, 1, 1, 1)

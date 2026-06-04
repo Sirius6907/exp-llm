@@ -9,6 +9,11 @@ import numpy as np
 import sys
 import os
 
+# Hot-patch torch.utils._pytree to fix diffusers compatibility with PyTorch 2.6.0+
+import torch.utils._pytree
+if not hasattr(torch.utils._pytree, 'register_constant'):
+    torch.utils._pytree.register_constant = lambda *args, **kwargs: None
+
 # Ensure local sirius_ops directory is on the path to import local PyO3 extension
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "sirius_ops"))
 
@@ -402,12 +407,19 @@ class ConsistencyDenoisingSolver(nn.Module):
                         nn.SiLU(),
                         nn.Linear(dim * 4, dim)
                     )
+                    self.grad_checkpointing = False
                 def forward(self, x):
-                    attn_out, _ = self.attn(x, x, x)
-                    x = self.norm1(x + attn_out)
-                    ffn_out = self.ffn(x)
-                    x = self.norm2(x + ffn_out)
-                    return x
+                    def _checkpointed_forward(tensor):
+                        attn_out, _ = self.attn(tensor, tensor, tensor)
+                        tensor = self.norm1(tensor + attn_out)
+                        ffn_out = self.ffn(tensor)
+                        tensor = self.norm2(tensor + ffn_out)
+                        return tensor
+                    if self.grad_checkpointing and x.requires_grad:
+                        from torch.utils.checkpoint import checkpoint
+                        return checkpoint(_checkpointed_forward, x, use_reentrant=False)
+                    else:
+                        return _checkpointed_forward(x)
                     
             self.dit_blocks = nn.ModuleList([DiTBlock(self.dit_dim) for _ in range(6)])
             self.dit_out = nn.Linear(self.dit_dim, latent_dim)
@@ -421,6 +433,11 @@ class ConsistencyDenoisingSolver(nn.Module):
                 nn.SiLU(),
                 nn.Linear(latent_dim, latent_dim)
             )
+
+    def set_grad_checkpointing(self, enable=True):
+        if self.scale_to_300m:
+            for block in self.dit_blocks:
+                block.grad_checkpointing = enable
 
     def forward(self, x_noise, conditioning_c, num_steps=4):
         """
@@ -475,6 +492,8 @@ class StableDiffusionVAEDecoder(nn.Module):
         
         # Learned projection: 256 channels → 4 channels for VAE
         self.latent_to_vae = nn.Linear(latent_dim, 4).to(self.device)
+        # Learned projection: 4 channels → 256 channels for DiT
+        self.vae_to_latent = nn.Linear(4, latent_dim).to(self.device)
         
         # Load pre-trained Stable Diffusion VAE
         print("[VAE Decoder] Loading pre-trained SD VAE from stabilityai/sd-vae-ft-mse...")
@@ -525,7 +544,7 @@ class StableDiffusionVAEDecoder(nn.Module):
             else:
                 raise ValueError(f"Invalid input shape for decode: {x_latent.shape}")
                 
-            vae_dtype = self.vae.dtype if hasattr(self.vae, "dtype") else torch.float32
+            vae_dtype = next(self.vae.parameters()).dtype if self.vae is not None else torch.float32
             x_spatial = x_spatial.to(vae_dtype)
             
             # Causal Temporal Folding frame-by-frame loop to keep peak VRAM < 3GB
@@ -541,6 +560,26 @@ class StableDiffusionVAEDecoder(nn.Module):
             return rgb
         else:
             return x_latent
+    
+    def encode_image_to_latent(self, image_tensor):
+        """
+        Encodes a real RGB image into VAE latent space for training ground truth.
+        Args:
+            image_tensor: (B, 3, H, W) normalized to [-1, 1] range
+        Returns:
+            latent: (B, 4, H//8, W//8) VAE latent representation
+        """
+        if self.vae is None:
+            raise RuntimeError("VAE not loaded — cannot encode images")
+        
+        vae_dtype = next(self.vae.parameters()).dtype if self.vae is not None else torch.float32
+        x = image_tensor.to(self.device).to(vae_dtype)
+        
+        with torch.no_grad():
+            posterior = self.vae.encode(x).latent_dist
+            latent = posterior.sample() * 0.18215  # SD VAE scaling factor
+        
+        return latent.float()
 
 class PixelleSiriusOrchestrator(nn.Module):
     """
@@ -729,6 +768,28 @@ class PixelleSiriusOrchestrator(nn.Module):
             else:
                 print(f"Loaded Qwen2 in 4-bit mode via device_map.")
                 
+            # Dynamically update vocabulary size and re-initialize text projections
+            # to match the pre-trained Qwen2 model and tokenizer size (151936).
+            qwen_vocab_size = self.real_qwen.config.vocab_size
+            self.vocab_size = qwen_vocab_size
+            self.text_embedding = nn.Embedding(self.vocab_size, self.vlm_dim).to(self.device)
+            self.text_head = nn.Linear(self.vlm_dim, self.vocab_size).to(self.device)
+            
+            # Re-initialize self.mcp to match the real Qwen2's hidden dimension (896)
+            qwen_hidden_dim = self.real_qwen.config.hidden_size
+            if self.scale_to_300m:
+                from mcp import MobileConditioningProjector
+                self.mcp = MobileConditioningProjector(
+                    vlm_dim=qwen_hidden_dim,
+                    dit_dim=self.dit_dim,
+                    num_layers=4,
+                    scale_to_300m=True
+                ).to(self.device)
+            else:
+                self.mcp = nn.Linear(qwen_hidden_dim, self.dit_dim).to(self.device)
+            
+            print(f"[Real Weight Integration] Updated orchestrator vocab_size to {self.vocab_size} and resized self.mcp input to match Qwen2 hidden_size {qwen_hidden_dim}.")
+            
             # Load and wrap SigLIP
             if effective_offload:
                 print(f"Loading {siglip_id} on CPU memory (with Layer Offloading)...")
@@ -796,7 +857,26 @@ class PixelleSiriusOrchestrator(nn.Module):
             print(f"[FAIL] Could not load real pre-trained weights: {e}")
             raise e
 
-
+    def get_text_conditioning(self, captions):
+        """
+        Extract text conditioning from captions using Qwen2 -> MCP pipeline.
+        Returns: list of hidden state tensors from the last 4 layers
+        """
+        if not self.real_weights_enabled or self.real_qwen is None:
+            raise RuntimeError("Real Qwen2 weights not loaded — cannot get text conditioning")
+            
+        inputs = self.real_tokenizer(
+            captions, padding=True, truncation=True, max_length=77,
+            return_tensors="pt"
+        )
+        input_ids = inputs["input_ids"].to(self.device)
+        
+        with torch.no_grad():
+            out = self.real_qwen(input_ids=input_ids, output_hidden_states=True)
+            # Get last 4 hidden states for MCP fusion
+            hidden_states = [h.float() for h in out.hidden_states[-4:]]
+            
+        return hidden_states
 
     def speculative_text_gen(self, prompt_tokens, steps=50, K_draft=4, thinking_mode=True, max_thinking_tokens=100):
         """
@@ -1472,9 +1552,9 @@ class PixelleSiriusOrchestrator(nn.Module):
         video_tokens = torch.cat(fused_frame_tokens, dim=1) # (B, S_frames, vlm_dim)
         
         # 5. Map video tokens to the exact hidden dimensions of real Qwen2 (896)
-        if not hasattr(self, "real_mcp") or self.real_mcp.in_features != self.vlm_dim:
-            self.real_mcp = nn.Linear(self.vlm_dim, 896).to(self.device)
-        video_tokens_projected = self.real_mcp(video_tokens).half() # Cast to half for Qwen2
+        if not hasattr(self, "real_video_projector") or self.real_video_projector.in_features != self.vlm_dim:
+            self.real_video_projector = nn.Linear(self.vlm_dim, 896).to(self.device)
+        video_tokens_projected = self.real_video_projector(video_tokens).half() # Cast to half for Qwen2
         
         # 6. Tokenize prompt text
         inputs = self.real_tokenizer(prompt_text, return_tensors="pt")

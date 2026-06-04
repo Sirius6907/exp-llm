@@ -111,15 +111,17 @@ def train_tokenflow_one_epoch():
             # 2. Semantic Alignment Loss (MSE between TokenFlow q_s and Teacher prior)
             loss_semantic = torch.mean((q_s - teacher_semantic_prior) ** 2)
             
-            # 3. Vector Quantization Commitment Loss (Bonsai / VQ style)
-            # Commitment loss keeps continuous projections close to discrete embeddings
-            # (Calculated within TokenFlowDualQuantizer, here mocked dynamically)
-            # sg[q_s] is handled in STE, commitment loss is minimized when projections match codebooks
-            loss_commit = 0.25 * torch.mean((q_s.detach() - q_s) ** 2) + 0.25 * torch.mean((q_p.detach() - q_p) ** 2)
+            # 3. Codebook & Commitment Loss (now computed inside quantizer)
+            # Use the quantizer's own codebook and commitment losses for proper gradient flow
+            q_s_seq = q_s.permute(0, 2, 3, 1).reshape(batch_x.size(0), -1, model.quantizer.semantic_dim)
+            q_p_seq = q_p.permute(0, 2, 3, 1).reshape(batch_x.size(0), -1, model.quantizer.pixel_dim)
+            _, _, _, losses = model.quantizer(q_s_seq.detach(), q_p_seq.detach(), return_losses=True)
+            loss_codebook = losses['codebook_s'] + losses['codebook_p']
+            loss_commit = 0.25 * (losses['commit_s'] + losses['commit_p'])
             
             # Joint Weighted Loss
-            # Target weights: lambda_recon = 1.0, lambda_sem = 0.5, lambda_commit = 1.0
-            total_loss = loss_recon + 0.5 * loss_semantic + loss_commit
+            # Target weights: lambda_recon = 1.0, lambda_sem = 0.5, lambda_codebook = 1.0, lambda_commit = 0.25
+            total_loss = loss_recon + 0.5 * loss_semantic + loss_codebook + loss_commit
             
             # Backward pass
             total_loss.backward()
@@ -133,10 +135,11 @@ def train_tokenflow_one_epoch():
             epoch_loss += total_loss.item()
             epoch_recon += loss_recon.item()
             epoch_semantic += loss_semantic.item()
+            epoch_codebook = epoch_loss.get('codebook', 0) + (loss_codebook.item() + loss_commit.item())
             epoch_commit += loss_commit.item()
             
             if (batch_idx + 1) % 4 == 0 or batch_idx == len(dataloader) - 1:
-                print(f"Batch {batch_idx+1}/{len(dataloader)} | Total Loss: {total_loss.item():.4f} | Recon: {loss_recon.item():.4f} | Sem: {loss_semantic.item():.4f} | Commit: {loss_commit.item():.4f}")
+                print(f"Batch {batch_idx+1}/{len(dataloader)} | Total: {total_loss.item():.4f} | Recon: {loss_recon.item():.4f} | Sem: {loss_semantic.item():.4f} | CB: {loss_codebook.item():.4f} | Cmt: {loss_commit.item():.4f}")
                 
         print(f"\n--- Epoch Summary ---")
         avg_loss = epoch_loss / len(dataloader)
